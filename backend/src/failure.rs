@@ -27,7 +27,6 @@ pub enum FailureKind {
     UnsupportedXml,
     XmlTooDeep,
     XmlTooComplex,
-    TooManyEntries,
     ParseFailed,
     Internal,
 }
@@ -57,7 +56,6 @@ impl FailureKind {
             Self::UnsupportedXml => "unsupported_xml",
             Self::XmlTooDeep => "xml_too_deep",
             Self::XmlTooComplex => "xml_too_complex",
-            Self::TooManyEntries => "too_many_entries",
             Self::ParseFailed => "parse_failed",
             Self::Internal => "internal",
         }

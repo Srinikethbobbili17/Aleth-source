@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -15,7 +15,10 @@ use crate::{
 #[derive(Debug)]
 pub enum RefreshError {
     NotFound,
+    /// Another refresh of this feed holds the lease.
     Busy,
+    /// The feed downloaded, but no parser slot freed up in time.
+    ParserBusy,
     CoolingDown,
     Upstream(Failure),
     Database,
@@ -23,7 +26,8 @@ pub enum RefreshError {
 }
 
 impl From<sqlx::Error> for RefreshError {
-    fn from(_: sqlx::Error) -> Self {
+    fn from(error: sqlx::Error) -> Self {
+        crate::db::log_error("refresh", &error);
         Self::Database
     }
 }
@@ -33,8 +37,22 @@ pub struct RefreshReport {
     pub inserted: usize,
     pub updated: usize,
     pub unchanged: usize,
+    /// Older entries left out because the feed exceeds the entry limit.
+    pub skipped: usize,
     pub not_modified: bool,
 }
+
+/// How long a downloaded feed waits for a parser slot before giving up. The
+/// download is already paid for, so waiting briefly beats discarding it.
+/// Consecutive failures after which a feed is marked dead. Automatic polling
+/// skips dead feeds; a successful manual refresh revives one.
+pub const DEAD_AFTER_FAILURES: i32 = 10;
+
+const PARSER_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(10)
+};
 
 #[derive(FromRow)]
 struct Lease {
@@ -70,11 +88,12 @@ pub async fn refresh(
         }
         FetchResult::Modified { body, validators } => {
             let base = validators.url.clone().unwrap_or(lease.url);
-            let permit = match parser_slots.try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
+            let permit = match tokio::time::timeout(PARSER_WAIT, parser_slots.acquire_owned()).await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
                     release(pool, feed_id, token).await?;
-                    return Err(RefreshError::Busy);
+                    return Err(RefreshError::ParserBusy);
                 }
             };
             let parsed = tokio::task::spawn_blocking(move || {
@@ -123,13 +142,17 @@ async fn release(pool: &PgPool, id: i64, token: Uuid) -> Result<(), sqlx::Error>
 
 async fn fail(pool: &PgPool, id: i64, token: Uuid, failure: &Failure) -> Result<(), sqlx::Error> {
     tracing::warn!(feed_id = id, code = failure.code(), "feed refresh failed");
-    sqlx::query(
+    let failures: Option<i32> = sqlx::query_scalar(
         "UPDATE feeds SET failure_count = LEAST(failure_count + 1, 100), last_error = $3, last_error_code = $5, \
+         dead_at = CASE WHEN failure_count + 1 >= $6 THEN COALESCE(dead_at, now()) ELSE dead_at END, \
          last_fetched_at = now(), refresh_token = NULL, refresh_until = NULL, \
          next_fetch_at = now() + make_interval(secs => GREATEST(LEAST(30.0 * power(2.0, LEAST(failure_count, 7)), 3600.0), COALESCE($4::double precision, 0))) \
-         WHERE id = $1 AND refresh_token = $2"
+         WHERE id = $1 AND refresh_token = $2 RETURNING failure_count"
     ).bind(id).bind(token).bind(failure.message.as_ref()).bind(failure.retry_after_seconds.map(|n| n as f64))
-        .bind(failure.code()).execute(pool).await?;
+        .bind(failure.code()).bind(DEAD_AFTER_FAILURES).fetch_optional(pool).await?;
+    if failures == Some(DEAD_AFTER_FAILURES) {
+        tracing::warn!(feed_id = id, failures, "feed marked dead");
+    }
     Ok(())
 }
 
@@ -157,6 +180,7 @@ async fn complete(
         ..Default::default()
     };
     if let Some(parsed) = parsed {
+        report.skipped = parsed.skipped;
         sqlx::query("UPDATE feeds SET title = $2 WHERE id = $1")
             .bind(feed_id)
             .bind(parsed.title)
@@ -198,7 +222,7 @@ async fn complete(
     }
     sqlx::query(
         "UPDATE feeds SET etag = $3, last_modified = $4, validator_url = $5, last_fetched_at = now(), \
-         last_success_at = now(), last_error = NULL, last_error_code = NULL, failure_count = 0, next_fetch_at = now() + interval '30 seconds', \
+         last_success_at = now(), last_error = NULL, last_error_code = NULL, dead_at = NULL, failure_count = 0, next_fetch_at = now() + interval '30 seconds', \
          refresh_token = NULL, refresh_until = NULL WHERE id = $1 AND refresh_token = $2"
     ).bind(feed_id).bind(token).bind(validators.etag).bind(validators.last_modified).bind(validators.url)
         .execute(&mut *tx).await?;
@@ -350,6 +374,67 @@ mod tests {
         let list = items::list(&pool, Some(feed.id), None, 10).await.unwrap();
         let titles: Vec<_> = list.iter().map(|item| item.title.as_deref()).collect();
         assert_eq!(titles, [Some("Newest"), Some("Oldest")]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL with CREATEDB"]
+    async fn ten_failures_mark_a_feed_dead_and_success_revives_it(pool: PgPool) {
+        let feed = crate::feeds::register(&pool, "https://example.com/feed")
+            .await
+            .unwrap();
+        let failure = Failure::new(
+            FailureKind::DnsFailed,
+            "could not resolve the feed's host name",
+        );
+        for attempt in 1..=DEAD_AFTER_FAILURES {
+            let token = ready(&pool, feed.id).await;
+            fail(&pool, feed.id, token, &failure).await.unwrap();
+            let dead = crate::feeds::get(&pool, feed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .dead_at;
+            assert_eq!(
+                dead.is_some(),
+                attempt == DEAD_AFTER_FAILURES,
+                "attempt {attempt}"
+            );
+        }
+        // A manual refresh is still allowed, and success revives the feed.
+        let token = ready(&pool, feed.id).await;
+        let report = complete(
+            &pool,
+            feed.id,
+            token,
+            Some(document("Back")),
+            Validators::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.inserted, 1);
+        let revived = crate::feeds::get(&pool, feed.id).await.unwrap().unwrap();
+        assert_eq!((revived.dead_at, revived.failure_count), (None, 0));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL with CREATEDB"]
+    async fn skipped_entries_are_reported(pool: PgPool) {
+        let feed = crate::feeds::register(&pool, "https://example.com/feed")
+            .await
+            .unwrap();
+        let items: Vec<String> = (0..1005)
+            .map(|i| format!(r#"{{"id":"{i}","content_text":"x"}}"#))
+            .collect();
+        let document = format!(
+            r#"{{"version":"https://jsonfeed.org/version/1.1","title":"Big","items":[{}]}}"#,
+            items.join(",")
+        );
+        let parsed = items::parse(document.as_bytes(), "https://example.com/feed").unwrap();
+        let token = ready(&pool, feed.id).await;
+        let report = complete(&pool, feed.id, token, Some(parsed), Validators::default())
+            .await
+            .unwrap();
+        assert_eq!((report.inserted, report.skipped), (1000, 5));
     }
 
     #[sqlx::test(migrations = "./migrations")]

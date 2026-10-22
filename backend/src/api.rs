@@ -2,7 +2,10 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{
+        DefaultBodyLimit, FromRequest, FromRequestParts, State,
+        rejection::{JsonRejection, PathRejection, QueryRejection},
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -39,6 +42,8 @@ pub(crate) fn router_with_fetcher(pool: PgPool, fetcher: Fetcher) -> Router {
         .route("/v1/items", get(list_items))
         .route("/v1/items/{id}", get(get_item))
         .route("/v1/feed-preview", post(preview_feed))
+        .fallback(route_not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(AppState {
@@ -51,7 +56,7 @@ pub(crate) fn router_with_fetcher(pool: PgPool, fetcher: Fetcher) -> Router {
 
 async fn get_feed(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    ApiPath(id): ApiPath<i64>,
 ) -> Result<Json<feeds::Feed>, ApiError> {
     positive_id(id)?;
     feeds::get(&state.pool, id)
@@ -67,7 +72,7 @@ async fn get_feed(
 
 async fn refresh_feed(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    ApiPath(id): ApiPath<i64>,
 ) -> Result<Json<ingest::RefreshReport>, ApiError> {
     positive_id(id)?;
     let _permit = state.refresh_slots.try_acquire_owned().map_err(|_| {
@@ -89,7 +94,12 @@ async fn refresh_feed(
                 RefreshError::Busy => ApiError::new(
                     StatusCode::CONFLICT,
                     "refresh_busy",
-                    "feed refresh or parser busy",
+                    "this feed is already being refreshed",
+                ),
+                RefreshError::ParserBusy => ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "parser_busy",
+                    "parser capacity busy; retry later",
                 ),
                 RefreshError::CoolingDown => ApiError::new(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -138,7 +148,7 @@ struct ItemPage {
 
 async fn list_items(
     State(state): State<AppState>,
-    Query(query): Query<ItemQuery>,
+    ApiQuery(query): ApiQuery<ItemQuery>,
 ) -> Result<Json<ItemPage>, ApiError> {
     if query.feed_id.is_some_and(|id| id <= 0)
         || query.before_id.is_some_and(|id| id <= 0)
@@ -166,7 +176,7 @@ async fn list_items(
 
 async fn get_item(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    ApiPath(id): ApiPath<i64>,
 ) -> Result<Json<items::ItemDetail>, ApiError> {
     positive_id(id)?;
     items::get(&state.pool, id)
@@ -214,7 +224,7 @@ struct RegisterFeed {
 
 async fn register_feed(
     State(state): State<AppState>,
-    Json(input): Json<RegisterFeed>,
+    ApiJson(input): ApiJson<RegisterFeed>,
 ) -> Result<Json<feeds::Feed>, ApiError> {
     let url = feeds::normalize_feed_url(&input.url).map_err(|message| {
         ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_url", message)
@@ -247,7 +257,7 @@ struct FeedPage {
 
 async fn list_feeds(
     State(state): State<AppState>,
-    Query(query): Query<FeedQuery>,
+    ApiQuery(query): ApiQuery<FeedQuery>,
 ) -> Result<Json<FeedPage>, ApiError> {
     if query.after_id < 0 || !(1..=100).contains(&query.limit) {
         return Err(ApiError::invalid(
@@ -278,7 +288,7 @@ struct PreviewRequest {
 
 async fn preview_feed(
     State(state): State<AppState>,
-    Json(input): Json<PreviewRequest>,
+    ApiJson(input): ApiJson<PreviewRequest>,
 ) -> Result<Json<feeds::FeedPreview>, ApiError> {
     if input.content.len() > feeds::MAX_PREVIEW_BYTES {
         return Err(ApiError::new(
@@ -312,6 +322,32 @@ async fn preview_feed(
     })?))
 }
 
+// Axum's extractors reject malformed input with plain-text bodies. These
+// wrappers route those rejections through ApiError so every error is JSON.
+#[derive(FromRequest)]
+#[from_request(via(axum::Json), rejection(ApiError))]
+struct ApiJson<T>(T);
+
+#[derive(FromRequestParts)]
+#[from_request(via(axum::extract::Path), rejection(ApiError))]
+struct ApiPath<T>(T);
+
+#[derive(FromRequestParts)]
+#[from_request(via(axum::extract::Query), rejection(ApiError))]
+struct ApiQuery<T>(T);
+
+async fn route_not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such route")
+}
+
+async fn method_not_allowed() -> ApiError {
+    ApiError::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "HTTP method not allowed for this route",
+    )
+}
+
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -331,18 +367,44 @@ impl ApiError {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_request", message)
     }
 
+    fn rejected(status: StatusCode, message: String) -> Self {
+        let code = match status {
+            StatusCode::PAYLOAD_TOO_LARGE => "too_large",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
+            _ => "invalid_request",
+        };
+        Self::new(status, code, message)
+    }
+
     fn failure(status: StatusCode, failure: Failure) -> Self {
         Self::new(status, failure.code(), failure.message)
     }
 
-    fn database(_error: sqlx::Error) -> Self {
-        // Database diagnostics may contain private URLs or query data.
-        tracing::error!("database operation failed");
+    fn database(error: sqlx::Error) -> Self {
+        crate::db::log_error("api", &error);
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "database_unavailable",
             "database unavailable",
         )
+    }
+}
+
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        Self::rejected(rejection.status(), rejection.body_text())
+    }
+}
+
+impl From<PathRejection> for ApiError {
+    fn from(rejection: PathRejection) -> Self {
+        Self::rejected(rejection.status(), rejection.body_text())
+    }
+}
+
+impl From<QueryRejection> for ApiError {
+    fn from(rejection: QueryRejection) -> Self {
+        Self::rejected(rejection.status(), rejection.body_text())
     }
 }
 

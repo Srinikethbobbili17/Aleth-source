@@ -32,11 +32,16 @@ The backend is ready for a TUI when all of these hold:
 
 - [ ] **Test the image on a second device**, ideally arm64 (Apple Silicon Mac or Raspberry Pi), since only amd64 has been built so far.
 
-- [ ] **Add CI (GitHub Actions).** Run `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, and the ignored PostgreSQL tests against a Postgres service container on every push.
-- [ ] **Log database error kinds** instead of the generic "database operation failed" (`ingest.rs` `From<sqlx::Error>`, `api.rs` `ApiError::database`).
-- [ ] **Large podcast feeds.** A 19.6 MiB / 3,013-episode podcast still fails (`too_large`, and it exceeds the 1,000-entry limit). Decide: keep the newest N entries instead of failing, and make limits configurable.
-- [ ] **Dead-feed handling.** Use `last_error_code` to stop retrying permanent failures (`dns_failed`, `not_a_feed`, HTTP 404/410) after repeated attempts.
-- [ ] **YouTube descriptions** (`media:description`) and a date fallback to `<updated>` when `published` is missing.
+- [x] **CI (GitHub Actions)** in `.github/workflows/backend.yml`: formatting, Clippy, unit/HTTP tests, PostgreSQL tests against a service container, and a Docker build + Compose health smoke test on every push and pull request.
+- [x] **B1:** database errors logged by kind, SQLSTATE, and constraint.
+- [x] **B2:** `parser_busy` separated from `refresh_busy`; a downloaded feed waits up to 10 s for a parser slot instead of being discarded at once.
+- [x] **B3:** every error is JSON with a `code`, including malformed requests, unknown routes, and wrong methods.
+- [x] **B6:** HTML detection skips XML declarations and comments.
+- [x] **B7:** publication date falls back to the entry's updated date.
+- [x] **Big feeds:** keep the latest 1,000 entries and report `skipped` (verified: arXiv CS 1,252 → 1,000; a 2,768-episode podcast → newest 1,000).
+- [x] **Dead feeds:** `dead_at` set after 10 consecutive failures; a successful manual refresh revives the feed.
+- [ ] **Very large feeds over 16 MiB** (for example The Daily, 19.6 MiB) still fail with `too_large`. Decide whether to raise the cap or make limits configurable.
+- [ ] **YouTube descriptions** (`media:description`).
 - [ ] **Add a `*/*` fallback to the `Accept` header** so strict publishers do not reject requests.
 - [ ] **Build a real-feed corpus.** Register the 10–20 feeds you actually read, refresh them all, and note every failure.
 

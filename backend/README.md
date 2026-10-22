@@ -17,6 +17,8 @@ docker compose logs -f backend
 docker compose down          # stop; add -v to also delete the database volume
 ```
 
+After code changes, `docker compose up -d --build` rebuilds and replaces the backend container. **podman-compose does not replace running containers on its own**; use `podman compose up -d --build --force-recreate`, or the old binary keeps running.
+
 Compose builds the image from `Dockerfile`, starts PostgreSQL, waits until it is healthy, then starts the backend, which applies migrations on startup. The API is published on `127.0.0.1:3000` only, because it has no authentication yet. Both services restart automatically unless stopped.
 
 | Variable | Default | Purpose |
@@ -105,7 +107,7 @@ The refresh response contains `inserted`, `updated`, `unchanged`, and `not_modif
 | `GET /v1/items/{id}` | Latest stored article content, metadata, and version ID; 404 if missing |
 | `POST /v1/feed-preview` | Body `{ "content": "raw feed text" }`; returns a title and entry metadata |
 
-Previews allow at most 1 MiB of decoded feed content and 1,000 entries, within a 2 MiB JSON request limit. Two parser tasks may run concurrently; additional preview work gets 503. Parsing runs outside the async executor. XML document types are rejected; XML input is limited to 64 nesting levels and an event count scaled to the 16 MiB feed limit (4,194,304 events); escaped HTML produces one event per entity, so this limit must stay generous. HTML sanitization is enabled in feed-rs. Clients must render titles and other metadata as text. Article content is tagged with its source content type; summaries can contain sanitized markup. A future reader still needs a restrictive content security policy and external-resource policy.
+Previews allow at most 1 MiB of decoded feed content, within a 2 MiB JSON request limit, and keep the latest 1,000 entries like refreshes do. Two parser tasks may run concurrently; additional preview work gets 503. Parsing runs outside the async executor. XML document types are rejected; XML input is limited to 64 nesting levels and an event count scaled to the 16 MiB feed limit (4,194,304 events); escaped HTML produces one event per entity, so this limit must stay generous. HTML sanitization is enabled in feed-rs. Clients must render titles and other metadata as text. Article content is tagged with its source content type; summaries can contain sanitized markup. A future reader still needs a restrictive content security policy and external-resource policy.
 
 Domain validation errors return 422 with `{ "error": "…", "code": "…" }`; database failures return a generic 503. Axum handles malformed JSON/query parameters and request-size rejection using its default responses. Future client contracts should normalize those errors too.
 
@@ -132,18 +134,22 @@ Every error body carries a stable `code`; clients should branch on it, not on me
 | `too_large` | More than 16 MiB after decompression |
 | `not_a_feed` | The URL returned an HTML web page |
 | `unsupported_xml`, `xml_too_deep`, `xml_too_complex` | XML document types, more than 64 nesting levels, or the event limit |
-| `too_many_entries` | More than 1,000 entries |
 | `parse_failed` | Not valid RSS, Atom, or JSON Feed |
 | `internal` | An unexpected backend fault |
 
-Other API codes are `invalid_request`, `not_found`, `capacity_busy`, `refresh_busy`, `parser_busy`, `cooling_down`, `lease_expired`, and `database_unavailable`.
+Other API codes: `invalid_request` (malformed path, query, or JSON), `unsupported_media_type` (missing `Content-Type: application/json`), `too_large` (request body over 2 MiB), `not_found` (missing resource or route), `method_not_allowed`, `capacity_busy` (all refresh slots in use), `refresh_busy` (this feed is already being refreshed), `parser_busy` (a downloaded feed waited 10 seconds without a free parser slot; the download is discarded but not counted as a feed failure), `cooling_down`, `lease_expired`, and `database_unavailable`. Every error, including malformed requests and unknown routes, is JSON.
+
+**Dead feeds.** After 10 consecutive failures a feed's `dead_at` is set and a `feed marked dead` warning is logged. Automatic polling, when it exists, must skip dead feeds. A manual refresh is still allowed; success clears `dead_at` and the failure count.
+
+**Database errors** are logged as `database operation failed` with `context`, `kind` (such as `io` or `pool_timed_out`), and, for PostgreSQL errors, `sqlstate` and `constraint`. Error messages are never logged, because they can contain feed URLs.
 
 ## Ingestion behavior
 
 - Item identity is scoped to a feed: explicit publisher ID first, normalized article URL second, deterministic content hash last. URL fragments are removed; query parameters are preserved. Relative article links resolve against the final feed URL.
 - Identical content keeps the existing version. Changed title, URL, authors, summary, content, or source timestamps create a new version on the same item. Older versions remain in PostgreSQL; a version-history API is not yet implemented.
 - Items missing both ID and URL are stable for repeated identical snapshots. Changed content becomes a new item because there is no reliable identity to associate the update with. A publisher changing its ID also creates a new item.
-- Duplicate IDs within one response use the first occurrence. Items disappearing from a rolling feed are retained. Missing publication dates remain null; ingestion order is independent of publication dates.
+- Duplicate IDs within one response use the first occurrence. Items disappearing from a rolling feed are retained. A missing publication date falls back to the entry's updated date (Atom requires only `updated`); it is null only when both are missing. Ingestion order is independent of publication dates.
+- A feed with more than 1,000 entries keeps the latest 1,000: by date when every entry has one, otherwise the first 1,000 in document order (feeds normally list newest first). The refresh report's `skipped` counts the rest.
 - Feed metadata, articles, versions, and HTTP validators commit in one transaction. Malformed responses preserve existing content and validators. A valid conditional 304 updates feed health without creating versions.
 - Refresh uses a 90-second database lease and a unique token. Competing refreshes are rejected; completion verifies token ownership. Crashes or cancelled requests can leave the lease until expiry. Persistence failures roll back; their leases also expire before retry.
 - Successful refreshes have a 30-second manual cooldown. Failures back off from 30 seconds to one hour, honoring larger `Retry-After` values on HTTP 429/503 up to 24 hours. This records retry eligibility but does not schedule work automatically.

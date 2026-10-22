@@ -703,6 +703,46 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL with CREATEDB"]
+    async fn parser_busy_releases_the_lease_without_counting_a_failure(pool: sqlx::PgPool) {
+        let publisher = Router::new().route(
+            "/feed",
+            get(|| async {
+                r#"{"version":"https://jsonfeed.org/version/1.1","title":"T","items":[]}"#
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, publisher).await.unwrap();
+        });
+        let client = client_builder()
+            .resolve_to_addrs("fixture.test", &[address])
+            .build()
+            .unwrap();
+        let fetcher = Fetcher::with_client(client);
+        let feed = crate::feeds::register(&pool, "http://fixture.test/feed")
+            .await
+            .unwrap();
+        // No parser slots at all: the download succeeds but cannot be parsed.
+        let result =
+            crate::ingest::refresh(&pool, &fetcher, Arc::new(Semaphore::new(0)), feed.id).await;
+        assert!(matches!(
+            result,
+            Err(crate::ingest::RefreshError::ParserBusy)
+        ));
+        let row: (Option<uuid::Uuid>, i32, Option<String>) = sqlx::query_as(
+            "SELECT refresh_token, failure_count, last_error_code FROM feeds WHERE id = $1",
+        )
+        .bind(feed.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (None, 0, None));
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL with CREATEDB"]
     async fn refresh_api_fetches_versions_and_preserves_content_after_parse_failure(
         pool: sqlx::PgPool,
     ) {

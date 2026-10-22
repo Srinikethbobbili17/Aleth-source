@@ -202,7 +202,7 @@ The identity preference is:
 
 Identity is unique **within a feed**, using the pair `(feed_id, identity)`. Two different feeds using the same publisher ID do not collide. Cross-publisher story deduplication is not implemented.
 
-URL normalization removes fragments and preserves query parameters. Missing publication dates remain null. A publisher repeating an identity within one document uses the first occurrence.
+URL normalization removes fragments and preserves query parameters. A missing publication date falls back to the entry's updated date and is null only when both are missing. A publisher repeating an identity within one document uses the first occurrence.
 
 ### Versioning answers “what changed?”
 
@@ -251,7 +251,7 @@ Expected application errors include 404 for a missing resource, 409 for refresh 
 | Whole fetch deadline | 40 seconds, including slot waiting, a connection retry, redirects, and body streaming |
 | Redirects | At most 5; HTTPS downgrade redirects rejected |
 | Downloaded feed size | At most 16 MiB after gzip decompression, including streamed responses without a declared size |
-| Entries in a parsed feed | At most 1,000 |
+| Entries in a parsed feed | The latest 1,000 are kept; the rest are reported as `skipped` |
 | XML structure | At most 64 nesting levels and 4,194,304 events (scaled to the size limit); document types rejected |
 | Preview request body | At most 2 MiB of JSON containing at most 1 MiB of decoded feed text |
 | Refresh lease | 90 seconds |

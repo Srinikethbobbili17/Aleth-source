@@ -6,13 +6,15 @@ use url::Url;
 
 use crate::{
     failure::{Failure, FailureKind},
-    feeds::{normalize_feed_url, validate_content},
+    feeds::{entry_date, latest_entries, normalize_feed_url, validate_content},
 };
 
 #[derive(Debug)]
 pub struct ParsedFeed {
     pub title: Option<String>,
     pub entries: Vec<NormalizedEntry>,
+    /// Older entries left out because the feed exceeds the entry limit.
+    pub skipped: usize,
 }
 
 #[derive(Debug)]
@@ -52,15 +54,11 @@ pub fn parse(content: &[u8], source_url: &str) -> Result<ParsedFeed, Failure> {
                 "could not parse RSS, Atom, or JSON Feed content",
             )
         })?;
-    if parsed.entries.len() > 1000 {
-        return Err(Failure::new(
-            FailureKind::TooManyEntries,
-            "feed has more than 1000 entries",
-        ));
-    }
-    let mut entries = Vec::with_capacity(parsed.entries.len());
+    let (latest, skipped) = latest_entries(parsed.entries);
+    let mut entries = Vec::with_capacity(latest.len());
     let mut identities = std::collections::HashSet::new();
-    for entry in parsed.entries {
+    for entry in latest {
+        let published_at = entry_date(&entry);
         let url = entry
             .links
             .iter()
@@ -102,7 +100,7 @@ pub fn parse(content: &[u8], source_url: &str) -> Result<ParsedFeed, Failure> {
             summary: entry.summary.map(|text| text.content),
             content,
             content_type,
-            published_at: entry.published,
+            published_at,
             source_updated_at: entry.updated,
         };
         let content_hash =
@@ -130,6 +128,7 @@ pub fn parse(content: &[u8], source_url: &str) -> Result<ParsedFeed, Failure> {
     Ok(ParsedFeed {
         title: parsed.title.map(|title| title.content),
         entries,
+        skipped,
     })
 }
 

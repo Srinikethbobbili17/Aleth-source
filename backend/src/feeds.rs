@@ -9,7 +9,8 @@ use crate::failure::{Failure, FailureKind};
 pub const MAX_FEED_BYTES: usize = 16 * 1024 * 1024;
 /// Previews arrive inside a JSON request body, which is capped at 2 MiB.
 pub const MAX_PREVIEW_BYTES: usize = 1024 * 1024;
-const MAX_PREVIEW_ENTRIES: usize = 1000;
+/// Entries kept from one feed document; older entries beyond this are skipped.
+pub(crate) const MAX_ENTRIES: usize = 1000;
 // Scaled to the byte limit: every XML event consumes at least a few bytes, and
 // escaped HTML produces one event per entity such as `&lt;`.
 const MAX_XML_EVENTS: usize = MAX_FEED_BYTES / 4;
@@ -63,16 +64,29 @@ pub(crate) fn validate_content(content: &[u8]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Detects HTML pages, skipping a leading XML declaration, processing
+/// instructions, and comments, which pages often place before the doctype.
 fn looks_like_html(content: &[u8]) -> bool {
-    let start = content
-        .strip_prefix(b"\xEF\xBB\xBF")
-        .unwrap_or(content)
-        .trim_ascii_start();
-    let prefix = &start[..start.len().min(14)];
-    prefix.eq_ignore_ascii_case(b"<!doctype html")
-        || prefix
-            .get(..5)
-            .is_some_and(|p| p.eq_ignore_ascii_case(b"<html"))
+    let mut rest = content.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(content);
+    loop {
+        rest = rest.trim_ascii_start();
+        let terminator: &[u8] = if rest.starts_with(b"<?") {
+            b"?>"
+        } else if rest.starts_with(b"<!--") {
+            b"-->"
+        } else {
+            break;
+        };
+        match rest.windows(terminator.len()).position(|w| w == terminator) {
+            Some(end) => rest = &rest[end + terminator.len()..],
+            None => return false,
+        }
+    }
+    let starts_with = |prefix: &[u8]| {
+        rest.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    };
+    starts_with(b"<!doctype html") || starts_with(b"<html")
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -87,6 +101,8 @@ pub struct Feed {
     pub failure_count: i32,
     pub last_error: Option<String>,
     pub last_error_code: Option<String>,
+    /// When the feed was marked dead after repeated failures; null if healthy.
+    pub dead_at: Option<DateTime<Utc>>,
 }
 
 /// Registration validates syntax only. A future fetcher must separately enforce
@@ -114,7 +130,7 @@ pub async fn register(pool: &PgPool, url: &str) -> Result<Feed, sqlx::Error> {
     sqlx::query_as(
         "INSERT INTO feeds (url) VALUES ($1) \
          ON CONFLICT (url) DO UPDATE SET url = EXCLUDED.url \
-         RETURNING id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code",
+         RETURNING id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code, dead_at",
     )
     .bind(url)
     .fetch_one(pool)
@@ -123,7 +139,7 @@ pub async fn register(pool: &PgPool, url: &str) -> Result<Feed, sqlx::Error> {
 
 pub async fn list(pool: &PgPool, after_id: i64, limit: i64) -> Result<Vec<Feed>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code FROM feeds \
+        "SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code, dead_at FROM feeds \
          WHERE id > $1 ORDER BY id LIMIT $2",
     )
     .bind(after_id)
@@ -133,7 +149,7 @@ pub async fn list(pool: &PgPool, after_id: i64, limit: i64) -> Result<Vec<Feed>,
 }
 
 pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Feed>, sqlx::Error> {
-    sqlx::query_as("SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code FROM feeds WHERE id = $1")
+    sqlx::query_as("SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code, dead_at FROM feeds WHERE id = $1")
         .bind(id).fetch_optional(pool).await
 }
 
@@ -141,6 +157,8 @@ pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Feed>, sqlx::Error> {
 pub struct FeedPreview {
     pub title: Option<String>,
     pub entries: Vec<EntryPreview>,
+    /// Older entries left out because the feed exceeds the entry limit.
+    pub skipped: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,6 +169,28 @@ pub struct EntryPreview {
     pub title: Option<String>,
     pub url: Option<String>,
     pub published_at: Option<DateTime<Utc>>,
+}
+
+/// Publication date, falling back to the entry's last-updated date. Atom
+/// requires `updated` but not `published`, and some feeds only provide one.
+pub(crate) fn entry_date(entry: &feed_rs::model::Entry) -> Option<DateTime<Utc>> {
+    entry.published.or(entry.updated)
+}
+
+/// Keeps the latest `MAX_ENTRIES` entries and returns how many were skipped.
+/// Feeds normally list newest first. When every entry has a date, sort by it
+/// so a feed listed oldest first still keeps its newest entries.
+pub(crate) fn latest_entries(
+    mut entries: Vec<feed_rs::model::Entry>,
+) -> (Vec<feed_rs::model::Entry>, usize) {
+    let skipped = entries.len().saturating_sub(MAX_ENTRIES);
+    if skipped > 0 {
+        if entries.iter().all(|entry| entry_date(entry).is_some()) {
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry_date(entry)));
+        }
+        entries.truncate(MAX_ENTRIES);
+    }
+    (entries, skipped)
 }
 
 pub fn preview(content: &[u8]) -> Result<FeedPreview, Failure> {
@@ -165,18 +205,14 @@ pub fn preview(content: &[u8]) -> Result<FeedPreview, Failure> {
                 "could not parse RSS, Atom, or JSON Feed content",
             )
         })?;
-    if feed.entries.len() > MAX_PREVIEW_ENTRIES {
-        return Err(Failure::new(
-            FailureKind::TooManyEntries,
-            "preview exceeds 1000 entries",
-        ));
-    }
+    let (entries, skipped) = latest_entries(feed.entries);
     Ok(FeedPreview {
         title: feed.title.map(|t| t.content),
-        entries: feed
-            .entries
+        skipped,
+        entries: entries
             .into_iter()
             .map(|entry| EntryPreview {
+                published_at: entry_date(&entry),
                 parsed_id: entry.id,
                 title: entry.title.map(|t| t.content),
                 url: entry
@@ -184,7 +220,6 @@ pub fn preview(content: &[u8]) -> Result<FeedPreview, Failure> {
                     .iter()
                     .filter(|link| link.rel.as_deref().is_none_or(|rel| rel == "alternate"))
                     .find_map(|link| normalize_feed_url(&link.href).ok()),
-                published_at: entry.published,
             })
             .collect(),
     })
@@ -211,10 +246,19 @@ mod tests {
 
     #[test]
     fn parses_rss_atom_and_json_without_inventing_publication_dates() {
-        for content in [
-            include_bytes!("../tests/fixtures/rss.xml").as_slice(),
-            include_bytes!("../tests/fixtures/atom.xml").as_slice(),
-            include_bytes!("../tests/fixtures/feed.json").as_slice(),
+        // The Atom fixture has only `updated`, which becomes the date; the
+        // others have no date at all and stay undated.
+        let atom_updated = "2026-10-21T00:00:00Z".parse::<DateTime<Utc>>().ok();
+        for (content, date) in [
+            (include_bytes!("../tests/fixtures/rss.xml").as_slice(), None),
+            (
+                include_bytes!("../tests/fixtures/atom.xml").as_slice(),
+                atom_updated,
+            ),
+            (
+                include_bytes!("../tests/fixtures/feed.json").as_slice(),
+                None,
+            ),
         ] {
             let parsed = preview(content).unwrap();
             assert_eq!(parsed.title.as_deref(), Some("Example feed"));
@@ -224,7 +268,7 @@ mod tests {
                 parsed.entries[0].url.as_deref(),
                 Some("https://example.com/first")
             );
-            assert!(parsed.entries[0].published_at.is_none());
+            assert_eq!(parsed.entries[0].published_at, date);
         }
     }
 
@@ -262,5 +306,67 @@ mod tests {
             "&lt;p&gt;text&lt;/p&gt;".repeat(30_000)
         );
         assert!(validate_content(escaped.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn html_detection_skips_declarations_and_comments() {
+        for page in [
+            b"<!-- site header --><!DOCTYPE html><html></html>".as_slice(),
+            b"<?xml version=\"1.0\"?>\n<!DOCTYPE html><html></html>",
+            b"<?xml version=\"1.0\"?><!-- a --> <!-- b --><html xmlns=\"x\"></html>",
+        ] {
+            assert_eq!(
+                validate_content(page).unwrap_err().kind,
+                FailureKind::NotAFeed
+            );
+        }
+        let feed = b"<?xml version=\"1.0\"?><?xml-stylesheet href=\"s.xsl\"?><!-- c --><rss/>";
+        assert!(validate_content(feed).is_ok());
+        // An unterminated comment is not mistaken for a page.
+        assert!(!looks_like_html(b"<!-- never closed <html>"));
+    }
+
+    fn json_feed(count: usize, dated: bool, oldest_first: bool) -> String {
+        let items: Vec<String> = (0..count)
+            .map(|i| {
+                let day = if oldest_first { i } else { count - 1 - i };
+                let date = chrono::DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::days(day as i64);
+                if dated {
+                    format!(
+                        r#"{{"id":"{day}","title":"t{day}","date_published":"{}"}}"#,
+                        date.to_rfc3339()
+                    )
+                } else {
+                    format!(r#"{{"id":"{day}","title":"t{day}"}}"#)
+                }
+            })
+            .collect();
+        format!(
+            r#"{{"version":"https://jsonfeed.org/version/1.1","title":"Big","items":[{}]}}"#,
+            items.join(",")
+        )
+    }
+
+    #[test]
+    fn big_feeds_keep_the_latest_thousand_entries() {
+        // Newest first, oldest first, and undated: all keep 1,000 and skip 500.
+        for (dated, oldest_first, first_kept) in [
+            (true, false, "1499"),
+            (true, true, "1499"),
+            (false, false, "1499"),
+        ] {
+            let preview = preview(json_feed(1500, dated, oldest_first).as_bytes()).unwrap();
+            assert_eq!(preview.entries.len(), MAX_ENTRIES);
+            assert_eq!(preview.skipped, 500);
+            assert_eq!(preview.entries[0].parsed_id, first_kept);
+            if dated {
+                assert_eq!(preview.entries[MAX_ENTRIES - 1].parsed_id, "500");
+            }
+        }
+        // Undated oldest-first feeds can only trust document order.
+        let undated = preview(json_feed(1500, false, true).as_bytes()).unwrap();
+        assert_eq!(undated.entries[0].parsed_id, "0");
+        let small = preview(json_feed(10, true, false).as_bytes()).unwrap();
+        assert_eq!((small.entries.len(), small.skipped), (10, 0));
     }
 }

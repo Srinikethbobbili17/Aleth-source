@@ -90,3 +90,66 @@ async fn preview_parses_uploaded_content_without_database_access() {
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(parsed["entries"][0]["title"], "First article");
 }
+
+#[tokio::test]
+async fn every_rejection_is_json_with_a_code() {
+    let app = router(unavailable_database());
+    let json = |method: &str, uri: &str, content_type: Option<&str>, body: &'static str| {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        request.body(Body::from(body)).unwrap()
+    };
+    for (request, status, code) in [
+        (
+            json("GET", "/v1/items/abc", None, ""),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            json("GET", "/v1/items?foo=1", None, ""),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            json("POST", "/v1/feeds", Some("application/json"), "{bad"),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            json(
+                "POST",
+                "/v1/feeds",
+                Some("application/json"),
+                r#"{"url":"https://a.test/f","x":1}"#,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_request",
+        ),
+        (
+            json("POST", "/v1/feeds", None, r#"{"url":"https://a.test/f"}"#),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+        ),
+        (
+            json("GET", "/v1/nope", None, ""),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            json("DELETE", "/v1/feeds/1", None, ""),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+        ),
+    ] {
+        let uri = request.uri().to_string();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status, "{uri}");
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|_| panic!("{uri}: body is not JSON"));
+        assert_eq!(body["code"], code, "{uri}");
+        assert!(body["error"].is_string(), "{uri}");
+    }
+}
