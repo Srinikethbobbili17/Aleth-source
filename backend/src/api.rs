@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -12,7 +12,7 @@ use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use tower_http::trace::TraceLayer;
 
-use crate::{feeds, fetch::Fetcher, ingest, items};
+use crate::{failure::Failure, feeds, fetch::Fetcher, ingest, items};
 
 #[derive(Clone)]
 struct AppState {
@@ -58,7 +58,11 @@ async fn get_feed(
         .await
         .map_err(ApiError::database)?
         .map(Json)
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "feed not found"))
+        .ok_or(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "feed not found",
+        ))
 }
 
 async fn refresh_feed(
@@ -67,8 +71,9 @@ async fn refresh_feed(
 ) -> Result<Json<ingest::RefreshReport>, ApiError> {
     positive_id(id)?;
     let _permit = state.refresh_slots.try_acquire_owned().map_err(|_| {
-        ApiError(
+        ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
+            "capacity_busy",
             "refresh capacity busy; retry later",
         )
     })?;
@@ -78,19 +83,32 @@ async fn refresh_feed(
         .map_err(|error| {
             use ingest::RefreshError;
             match error {
-                RefreshError::NotFound => ApiError(StatusCode::NOT_FOUND, "feed not found"),
-                RefreshError::Busy => ApiError(StatusCode::CONFLICT, "feed refresh or parser busy"),
-                RefreshError::CoolingDown => ApiError(
+                RefreshError::NotFound => {
+                    ApiError::new(StatusCode::NOT_FOUND, "not_found", "feed not found")
+                }
+                RefreshError::Busy => ApiError::new(
+                    StatusCode::CONFLICT,
+                    "refresh_busy",
+                    "feed refresh or parser busy",
+                ),
+                RefreshError::CoolingDown => ApiError::new(
                     StatusCode::TOO_MANY_REQUESTS,
+                    "cooling_down",
                     "feed is cooling down; check next_fetch_at",
                 ),
-                RefreshError::LeaseExpired => {
-                    ApiError(StatusCode::CONFLICT, "refresh lease expired; retry later")
+                RefreshError::LeaseExpired => ApiError::new(
+                    StatusCode::CONFLICT,
+                    "lease_expired",
+                    "refresh lease expired; retry later",
+                ),
+                RefreshError::Upstream(failure) => {
+                    ApiError::failure(StatusCode::BAD_GATEWAY, failure)
                 }
-                RefreshError::Upstream(message) => ApiError(StatusCode::BAD_GATEWAY, message),
-                RefreshError::Database => {
-                    ApiError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable")
-                }
+                RefreshError::Database => ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "database_unavailable",
+                    "database unavailable",
+                ),
             }
         })
 }
@@ -155,7 +173,11 @@ async fn get_item(
         .await
         .map_err(ApiError::database)?
         .map(Json)
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "item not found"))
+        .ok_or(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "item not found",
+        ))
 }
 
 #[derive(Serialize)]
@@ -194,7 +216,9 @@ async fn register_feed(
     State(state): State<AppState>,
     Json(input): Json<RegisterFeed>,
 ) -> Result<Json<feeds::Feed>, ApiError> {
-    let url = feeds::normalize_feed_url(&input.url).map_err(ApiError::invalid)?;
+    let url = feeds::normalize_feed_url(&input.url).map_err(|message| {
+        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_url", message)
+    })?;
     Ok(Json(
         feeds::register(&state.pool, &url)
             .await
@@ -256,37 +280,69 @@ async fn preview_feed(
     State(state): State<AppState>,
     Json(input): Json<PreviewRequest>,
 ) -> Result<Json<feeds::FeedPreview>, ApiError> {
-    if input.content.len() > feeds::MAX_FEED_BYTES {
-        return Err(ApiError(
+    if input.content.len() > feeds::MAX_PREVIEW_BYTES {
+        return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
             "feed content exceeds 1 MiB",
         ));
     }
-    let permit = state
-        .parser_slots
-        .try_acquire_owned()
-        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "parser busy; retry later"))?;
+    let permit = state.parser_slots.try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "parser_busy",
+            "parser busy; retry later",
+        )
+    })?;
     let parsed = tokio::task::spawn_blocking(move || {
         // Hold the slot until parsing ends even if the HTTP request is cancelled.
         let _permit = permit;
         feeds::preview(input.content.as_bytes())
     })
     .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "parser failed"))?;
-    Ok(Json(parsed.map_err(ApiError::invalid)?))
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "parser failed",
+        )
+    })?;
+    Ok(Json(parsed.map_err(|failure| {
+        ApiError::failure(StatusCode::UNPROCESSABLE_ENTITY, failure)
+    })?))
 }
 
-struct ApiError(StatusCode, &'static str);
+struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: Cow<'static, str>,
+}
 
 impl ApiError {
+    fn new(status: StatusCode, code: &'static str, message: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
     fn invalid(message: &'static str) -> Self {
-        Self(StatusCode::UNPROCESSABLE_ENTITY, message)
+        Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_request", message)
+    }
+
+    fn failure(status: StatusCode, failure: Failure) -> Self {
+        Self::new(status, failure.code(), failure.message)
     }
 
     fn database(_error: sqlx::Error) -> Self {
         // Database diagnostics may contain private URLs or query data.
         tracing::error!("database operation failed");
-        Self(StatusCode::SERVICE_UNAVAILABLE, "database unavailable")
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database_unavailable",
+            "database unavailable",
+        )
     }
 }
 
@@ -294,8 +350,13 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         #[derive(Serialize)]
         struct ErrorBody {
-            error: &'static str,
+            error: Cow<'static, str>,
+            code: &'static str,
         }
-        (self.0, Json(ErrorBody { error: self.1 })).into_response()
+        let body = ErrorBody {
+            error: self.message,
+            code: self.code,
+        };
+        (self.status, Json(body)).into_response()
     }
 }

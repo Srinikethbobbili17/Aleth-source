@@ -7,6 +7,7 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
+    failure::{Failure, FailureKind},
     fetch::{FetchResult, Fetcher, Validators},
     items::{self, ParsedFeed},
 };
@@ -16,7 +17,7 @@ pub enum RefreshError {
     NotFound,
     Busy,
     CoolingDown,
-    Upstream(&'static str),
+    Upstream(Failure),
     Database,
     LeaseExpired,
 }
@@ -58,16 +59,9 @@ pub async fn refresh(
     };
     let fetched = match fetcher.fetch(&lease.url, &validators).await {
         Ok(fetched) => fetched,
-        Err(error) => {
-            fail(
-                pool,
-                feed_id,
-                token,
-                error.message,
-                error.retry_after_seconds,
-            )
-            .await?;
-            return Err(RefreshError::Upstream(error.message));
+        Err(failure) => {
+            fail(pool, feed_id, token, &failure).await?;
+            return Err(RefreshError::Upstream(failure));
         }
     };
     match fetched {
@@ -88,12 +82,12 @@ pub async fn refresh(
                 items::parse(&body, &base)
             })
             .await
-            .unwrap_or(Err("feed parser failed"));
+            .unwrap_or_else(|_| Err(Failure::new(FailureKind::Internal, "feed parser crashed")));
             match parsed {
                 Ok(parsed) => complete(pool, feed_id, token, Some(parsed), validators).await,
-                Err(message) => {
-                    fail(pool, feed_id, token, message, None).await?;
-                    Err(RefreshError::Upstream(message))
+                Err(failure) => {
+                    fail(pool, feed_id, token, &failure).await?;
+                    Err(RefreshError::Upstream(failure))
                 }
             }
         }
@@ -127,19 +121,15 @@ async fn release(pool: &PgPool, id: i64, token: Uuid) -> Result<(), sqlx::Error>
     Ok(())
 }
 
-async fn fail(
-    pool: &PgPool,
-    id: i64,
-    token: Uuid,
-    message: &str,
-    retry_after: Option<i64>,
-) -> Result<(), sqlx::Error> {
+async fn fail(pool: &PgPool, id: i64, token: Uuid, failure: &Failure) -> Result<(), sqlx::Error> {
+    tracing::warn!(feed_id = id, code = failure.code(), "feed refresh failed");
     sqlx::query(
-        "UPDATE feeds SET failure_count = LEAST(failure_count + 1, 100), last_error = $3, \
+        "UPDATE feeds SET failure_count = LEAST(failure_count + 1, 100), last_error = $3, last_error_code = $5, \
          last_fetched_at = now(), refresh_token = NULL, refresh_until = NULL, \
          next_fetch_at = now() + make_interval(secs => GREATEST(LEAST(30.0 * power(2.0, LEAST(failure_count, 7)), 3600.0), COALESCE($4::double precision, 0))) \
          WHERE id = $1 AND refresh_token = $2"
-    ).bind(id).bind(token).bind(message).bind(retry_after.map(|n| n as f64)).execute(pool).await?;
+    ).bind(id).bind(token).bind(failure.message.as_ref()).bind(failure.retry_after_seconds.map(|n| n as f64))
+        .bind(failure.code()).execute(pool).await?;
     Ok(())
 }
 
@@ -208,7 +198,7 @@ async fn complete(
     }
     sqlx::query(
         "UPDATE feeds SET etag = $3, last_modified = $4, validator_url = $5, last_fetched_at = now(), \
-         last_success_at = now(), last_error = NULL, failure_count = 0, next_fetch_at = now() + interval '30 seconds', \
+         last_success_at = now(), last_error = NULL, last_error_code = NULL, failure_count = 0, next_fetch_at = now() + interval '30 seconds', \
          refresh_token = NULL, refresh_until = NULL WHERE id = $1 AND refresh_token = $2"
     ).bind(feed_id).bind(token).bind(validators.etag).bind(validators.last_modified).bind(validators.url)
         .execute(&mut *tx).await?;
@@ -387,13 +377,27 @@ mod tests {
             .await,
             Err(RefreshError::LeaseExpired)
         ));
-        fail(&pool, feed.id, newer, "invalid feed", Some(120))
-            .await
-            .unwrap();
-        let row: (String, i32, bool, Option<Uuid>) = sqlx::query_as(
-            "SELECT etag, failure_count, next_fetch_at > now() + interval '100 seconds', refresh_token FROM feeds WHERE id = $1"
+        let failure = Failure {
+            retry_after_seconds: Some(120),
+            ..Failure::new(
+                FailureKind::HttpStatus,
+                "publisher returned HTTP 429 Too Many Requests",
+            )
+        };
+        fail(&pool, feed.id, newer, &failure).await.unwrap();
+        let row: (String, i32, bool, Option<Uuid>, Option<String>) = sqlx::query_as(
+            "SELECT etag, failure_count, next_fetch_at > now() + interval '100 seconds', refresh_token, last_error_code FROM feeds WHERE id = $1"
         ).bind(feed.id).fetch_one(&pool).await.unwrap();
-        assert_eq!(row, ("old".to_owned(), 1, true, None));
+        assert_eq!(
+            row,
+            (
+                "old".to_owned(),
+                1,
+                true,
+                None,
+                Some("http_status".to_owned())
+            )
+        );
         assert!(matches!(
             claim(&pool, feed.id, Uuid::new_v4()).await,
             Err(RefreshError::CoolingDown)

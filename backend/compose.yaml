@@ -1,9 +1,12 @@
+# `docker compose up -d` (or `podman compose up -d`) builds and runs PostgreSQL
+# and the backend. `docker compose up -d postgres` starts only the database for
+# running the backend natively with `cargo run`.
 services:
   postgres:
     image: docker.io/library/postgres:17-bookworm
     environment:
       POSTGRES_USER: rss
-      POSTGRES_PASSWORD: rss_dev_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rss_dev_password}
       POSTGRES_DB: rss
     ports:
       - "127.0.0.1:5432:5432"
@@ -14,7 +17,27 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
+
+  backend:
+    build: .
+    environment:
+      DATABASE_URL: postgres://rss:${POSTGRES_PASSWORD:-rss_dev_password}@postgres:5432/rss
+      BIND_ADDR: 0.0.0.0:3000
+      RUST_LOG: ${RUST_LOG:-rss_backend=info,tower_http=info}
+    # The API has no authentication yet, so publish it on this machine only.
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rss-backend", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
 
 volumes:
   postgres_data:
-

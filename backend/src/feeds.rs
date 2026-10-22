@@ -3,26 +3,51 @@ use serde::Serialize;
 use sqlx::{FromRow, PgPool};
 use url::Url;
 
-pub const MAX_FEED_BYTES: usize = 1024 * 1024;
-const MAX_PREVIEW_ENTRIES: usize = 1000;
+use crate::failure::{Failure, FailureKind};
 
-pub(crate) fn validate_content(content: &[u8]) -> Result<(), &'static str> {
+/// Largest feed body accepted after decompression.
+pub const MAX_FEED_BYTES: usize = 16 * 1024 * 1024;
+/// Previews arrive inside a JSON request body, which is capped at 2 MiB.
+pub const MAX_PREVIEW_BYTES: usize = 1024 * 1024;
+const MAX_PREVIEW_ENTRIES: usize = 1000;
+// Scaled to the byte limit: every XML event consumes at least a few bytes, and
+// escaped HTML produces one event per entity such as `&lt;`.
+const MAX_XML_EVENTS: usize = MAX_FEED_BYTES / 4;
+
+pub(crate) fn validate_content(content: &[u8]) -> Result<(), Failure> {
     if content.len() > MAX_FEED_BYTES {
-        return Err("feed content exceeds 1 MiB");
+        return Err(Failure::new(
+            FailureKind::TooLarge,
+            "feed content exceeds 16 MiB",
+        ));
+    }
+    if looks_like_html(content) {
+        return Err(Failure::new(
+            FailureKind::NotAFeed,
+            "URL returned an HTML web page, not a feed",
+        ));
     }
     if content.iter().find(|&&byte| byte == b'<' || byte == b'{') == Some(&b'<') {
         let mut reader = quick_xml::Reader::from_reader(content);
         let mut depth = 0usize;
-        for _ in 0..50_000 {
+        for _ in 0..MAX_XML_EVENTS {
             use quick_xml::events::Event;
-            match reader.read_event().map_err(|_| "invalid XML structure")? {
+            match reader.read_event().map_err(|_| {
+                Failure::new(FailureKind::ParseFailed, "feed is not well-formed XML")
+            })? {
                 Event::DocType(_) => {
-                    return Err("XML document types and entities are not supported");
+                    return Err(Failure::new(
+                        FailureKind::UnsupportedXml,
+                        "XML document types and entities are not supported",
+                    ));
                 }
                 Event::Start(_) => {
                     depth += 1;
                     if depth > 64 {
-                        return Err("XML nesting exceeds 64 levels");
+                        return Err(Failure::new(
+                            FailureKind::XmlTooDeep,
+                            "XML nesting exceeds 64 levels",
+                        ));
                     }
                 }
                 Event::End(_) => depth = depth.saturating_sub(1),
@@ -30,9 +55,24 @@ pub(crate) fn validate_content(content: &[u8]) -> Result<(), &'static str> {
                 _ => {}
             }
         }
-        return Err("XML exceeds event limit");
+        return Err(Failure::new(
+            FailureKind::XmlTooComplex,
+            "XML exceeds the event limit",
+        ));
     }
     Ok(())
+}
+
+fn looks_like_html(content: &[u8]) -> bool {
+    let start = content
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(content)
+        .trim_ascii_start();
+    let prefix = &start[..start.len().min(14)];
+    prefix.eq_ignore_ascii_case(b"<!doctype html")
+        || prefix
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"<html"))
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -46,6 +86,7 @@ pub struct Feed {
     pub next_fetch_at: DateTime<Utc>,
     pub failure_count: i32,
     pub last_error: Option<String>,
+    pub last_error_code: Option<String>,
 }
 
 /// Registration validates syntax only. A future fetcher must separately enforce
@@ -73,7 +114,7 @@ pub async fn register(pool: &PgPool, url: &str) -> Result<Feed, sqlx::Error> {
     sqlx::query_as(
         "INSERT INTO feeds (url) VALUES ($1) \
          ON CONFLICT (url) DO UPDATE SET url = EXCLUDED.url \
-         RETURNING id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error",
+         RETURNING id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code",
     )
     .bind(url)
     .fetch_one(pool)
@@ -82,7 +123,7 @@ pub async fn register(pool: &PgPool, url: &str) -> Result<Feed, sqlx::Error> {
 
 pub async fn list(pool: &PgPool, after_id: i64, limit: i64) -> Result<Vec<Feed>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error FROM feeds \
+        "SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code FROM feeds \
          WHERE id > $1 ORDER BY id LIMIT $2",
     )
     .bind(after_id)
@@ -92,7 +133,7 @@ pub async fn list(pool: &PgPool, after_id: i64, limit: i64) -> Result<Vec<Feed>,
 }
 
 pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Feed>, sqlx::Error> {
-    sqlx::query_as("SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error FROM feeds WHERE id = $1")
+    sqlx::query_as("SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code FROM feeds WHERE id = $1")
         .bind(id).fetch_optional(pool).await
 }
 
@@ -112,15 +153,23 @@ pub struct EntryPreview {
     pub published_at: Option<DateTime<Utc>>,
 }
 
-pub fn preview(content: &[u8]) -> Result<FeedPreview, &'static str> {
+pub fn preview(content: &[u8]) -> Result<FeedPreview, Failure> {
     validate_content(content)?;
     let feed = feed_rs::parser::Builder::new()
         .sanitize_content(true)
         .build()
         .parse(content)
-        .map_err(|_| "could not parse RSS, Atom, or JSON Feed content")?;
+        .map_err(|_| {
+            Failure::new(
+                FailureKind::ParseFailed,
+                "could not parse RSS, Atom, or JSON Feed content",
+            )
+        })?;
     if feed.entries.len() > MAX_PREVIEW_ENTRIES {
-        return Err("preview exceeds 1000 entries");
+        return Err(Failure::new(
+            FailureKind::TooManyEntries,
+            "preview exceeds 1000 entries",
+        ));
     }
     Ok(FeedPreview {
         title: feed.title.map(|t| t.content),
@@ -189,5 +238,29 @@ mod tests {
             validate_content(br#"<!DOCTYPE rss [<!ENTITY x SYSTEM "file:///etc/passwd">]><rss/>"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn web_pages_and_escaped_html_get_distinct_results() {
+        for page in [
+            b"<!DOCTYPE html><html><body>hi</body></html>".as_slice(),
+            b"\xEF\xBB\xBF  <HTML lang=en></HTML>",
+        ] {
+            assert_eq!(
+                validate_content(page).unwrap_err().kind,
+                FailureKind::NotAFeed
+            );
+        }
+        let doctype = br#"<!DOCTYPE rss [<!ENTITY x "y">]><rss/>"#;
+        assert_eq!(
+            validate_content(doctype).unwrap_err().kind,
+            FailureKind::UnsupportedXml
+        );
+        // TechCrunch-style descriptions: escaped HTML yields one event per entity.
+        let escaped = format!(
+            "<rss><channel><item><description>{}</description></item></channel></rss>",
+            "&lt;p&gt;text&lt;/p&gt;".repeat(30_000)
+        );
+        assert!(validate_content(escaped.as_bytes()).is_ok());
     }
 }

@@ -6,6 +6,35 @@ All implementation lives here, outside `../docs/`. The broader proposal is in [t
 
 This is a local, single-user foundation. Registration stores the URL; the separate refresh endpoint fetches and persists articles. Previews still parse supplied content without persistence. Authentication, automatic scheduling, synchronization, and AI remain subsequent milestones. Keep this unauthenticated API on loopback during development.
 
+## Run with Docker
+
+The only requirement is Docker (Docker Desktop on Windows or macOS) or Podman with a Compose provider. No Rust toolchain or local PostgreSQL is needed. From this directory:
+
+```bash
+docker compose up -d --build
+curl http://127.0.0.1:3000/health/ready
+docker compose logs -f backend
+docker compose down          # stop; add -v to also delete the database volume
+```
+
+Compose builds the image from `Dockerfile`, starts PostgreSQL, waits until it is healthy, then starts the backend, which applies migrations on startup. The API is published on `127.0.0.1:3000` only, because it has no authentication yet. Both services restart automatically unless stopped.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `POSTGRES_PASSWORD` | `rss_dev_password` | Database password, used by both services. Use URL-safe characters, because it is embedded in `DATABASE_URL`. |
+| `RUST_LOG` | `rss_backend=info,tower_http=info` | Log filter |
+
+Set them in the shell or in a `.env` file next to `compose.yaml`; Compose reads that file automatically.
+
+**The image.** `Dockerfile` compiles a release binary in `rust:1.99-bookworm` and copies only the binary into `gcr.io/distroless/cc-debian12:nonroot`: no shell, no package manager, and a non-root user. HTTPS trust roots are compiled into the binary. The container health check runs `rss-backend healthcheck`, which exits 0 only when `/health/ready` returns 200. Build it on its own with:
+
+```bash
+docker build -t rss-backend .
+docker build --build-arg CARGO_BUILD_JOBS=2 -t rss-backend .   # lower peak memory, e.g. Raspberry Pi
+```
+
+**Other devices.** Both base images are published for `linux/amd64` and `linux/arm64` (among others), so the same files build natively on Intel/AMD machines, Apple Silicon Macs, ARM servers, and a 64-bit Raspberry Pi. Docker Desktop runs Linux containers on Windows and macOS. To build an image for another architecture from one machine, use `docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/rss-backend --push .`; cross-architecture builds run under emulation and are much slower.
+
 ## Run locally
 
 Requirements: a current stable Rust toolchain, and PostgreSQL 17 (or Docker/Podman to run it). Dependencies are resolved in `Cargo.lock`; keep that file committed.
@@ -76,11 +105,38 @@ The refresh response contains `inserted`, `updated`, `unchanged`, and `not_modif
 | `GET /v1/items/{id}` | Latest stored article content, metadata, and version ID; 404 if missing |
 | `POST /v1/feed-preview` | Body `{ "content": "raw feed text" }`; returns a title and entry metadata |
 
-Previews allow at most 1 MiB of decoded feed content and 1,000 entries, within a 2 MiB JSON request limit. Two parser tasks may run concurrently; additional preview work gets 503. Parsing runs outside the async executor. XML document types are rejected; XML input is limited to 64 nesting levels and 50,000 events. HTML sanitization is enabled in feed-rs. Clients must render titles and other metadata as text. Article content is tagged with its source content type; summaries can contain sanitized markup. A future reader still needs a restrictive content security policy and external-resource policy.
+Previews allow at most 1 MiB of decoded feed content and 1,000 entries, within a 2 MiB JSON request limit. Two parser tasks may run concurrently; additional preview work gets 503. Parsing runs outside the async executor. XML document types are rejected; XML input is limited to 64 nesting levels and an event count scaled to the 16 MiB feed limit (4,194,304 events); escaped HTML produces one event per entity, so this limit must stay generous. HTML sanitization is enabled in feed-rs. Clients must render titles and other metadata as text. Article content is tagged with its source content type; summaries can contain sanitized markup. A future reader still needs a restrictive content security policy and external-resource policy.
 
-Domain validation errors return 422 with `{ "error": "…" }`; database failures return a generic 503. Axum handles malformed JSON/query parameters and request-size rejection using its default responses. Future client contracts should normalize those errors too.
+Domain validation errors return 422 with `{ "error": "…", "code": "…" }`; database failures return a generic 503. Axum handles malformed JSON/query parameters and request-size rejection using its default responses. Future client contracts should normalize those errors too.
 
 Refresh errors use 404 for missing feeds, 409 for an active/expired lease or busy parser, 429 during cooldown, 502 for publisher/network/parse failures, and 503 for database or overall capacity problems. Check feed health for `next_fetch_at` before retrying.
+
+Every error body carries a stable `code`; clients should branch on it, not on message text. A failed refresh also stores the code in the feed's `last_error_code` and a readable message in `last_error`. Each cause has its own code and message:
+
+| Code | Meaning |
+| --- | --- |
+| `invalid_url` | The feed URL or redirect target is not a usable HTTP(S) URL |
+| `blocked_destination` | The address is private/reserved, or the host resolves only to such addresses |
+| `blocked_port` | The port is not 80 or 443 |
+| `dns_failed` | The host name did not resolve |
+| `connect_timeout` | No TCP/TLS connection within 10 seconds (retried once) |
+| `connect_failed` | The connection was refused or reset (retried once) |
+| `tls_failed` | The TLS handshake failed, for example an expired or invalid certificate |
+| `response_timeout` | The server stopped responding or sending the body within 15 seconds |
+| `deadline_exceeded` | The whole fetch exceeded 40 seconds |
+| `too_many_redirects`, `invalid_redirect`, `insecure_redirect` | Redirect problems: more than 5 hops, a bad Location, or HTTPS to HTTP |
+| `http_status` | A non-200 status; the message includes it, such as `HTTP 404 Not Found` |
+| `unexpected_not_modified` | A 304 without a conditional request |
+| `unsupported_encoding`, `decompress_failed` | Compression other than gzip, or corrupt gzip |
+| `body_read_failed` | The connection dropped mid-download |
+| `too_large` | More than 16 MiB after decompression |
+| `not_a_feed` | The URL returned an HTML web page |
+| `unsupported_xml`, `xml_too_deep`, `xml_too_complex` | XML document types, more than 64 nesting levels, or the event limit |
+| `too_many_entries` | More than 1,000 entries |
+| `parse_failed` | Not valid RSS, Atom, or JSON Feed |
+| `internal` | An unexpected backend fault |
+
+Other API codes are `invalid_request`, `not_found`, `capacity_busy`, `refresh_busy`, `parser_busy`, `cooling_down`, `lease_expired`, and `database_unavailable`.
 
 ## Ingestion behavior
 
@@ -96,7 +152,9 @@ Refresh errors use 404 for missing feeds, 409 for an active/expired lease or bus
 
 The HTTP client permits HTTP(S) on ports 80 and 443. It rejects credentials in URLs, private/loopback/link-local/special-use IPs, IPv6 transition ranges, and non-public addresses in DNS answers (they are dropped; a host with no public address is rejected, which keeps DNS64 networks working). Validated DNS results go directly to the connector. Environment proxies are disabled. Every redirect is revalidated, with a maximum of five hops; HTTPS-to-HTTP redirects are rejected. Conditional validators are sent only to the exact URL they describe.
 
-Limits: four concurrent refreshes, two requests per hostname, five-second connection timeout, and a twenty-second total fetch deadline including redirects and body streaming. Responses are capped at 1 MiB even when streamed without Content-Length. The initial implementation requests identity encoding and rejects compressed responses, so a publisher that insists on gzip needs a later bounded decompression implementation. Only status 200 provides a new body; status 304 is accepted only after sending conditional headers.
+Limits: four concurrent refreshes, two requests per hostname, a ten-second connect budget (DNS, TCP, and TLS), a fifteen-second per-request timeout, and a forty-second total fetch deadline including redirects and body streaming. The resolver keeps at most two addresses per IP family because hyper-util divides the connect budget across them; this leaves each address time for TCP SYN retransmission. A failed connection is retried once after 500 ms, which is safe because the request was never delivered. On some networks a DNS lookup occasionally takes five seconds; the ten-second budget absorbs that.
+
+The client requests gzip and decodes it while streaming. Bodies are capped at 16 MiB after decompression, so a compression bomb stops at the limit; other encodings are rejected. Only status 200 provides a new body; status 304 is accepted only after sending conditional headers.
 
 This deliberately conservative destination policy may reject unusual public hosting arrangements or nonstandard ports. Its address classification should be reviewed as special-use allocations change. The implementation uses [Reqwest's resolver and redirect controls](https://docs.rs/reqwest/0.12.28/reqwest/struct.ClientBuilder.html).
 
@@ -120,7 +178,7 @@ The manual ingestion milestone is implemented. Next, make updates happen reliabl
 
 1. Add a durable scheduler/worker that selects due feeds, reuses ingestion leases, and recovers after restart.
 2. Separate a user-triggered refresh cooldown from the automatic polling schedule; add publication-aware intervals and jitter.
-3. Add fixture coverage for the actual feeds you read and bounded gzip decompression for publishers that require it.
+3. Add fixture coverage for the actual feeds you read.
 4. Add accounts and scoped subscriptions before exposing this API beyond local development; follow with read/star state and synchronization.
 
 Your most useful immediate contribution remains a real-feed corpus and a short description of your daily reading workflow: folders you use, what you save, and what feels repetitive. Those inputs will shape both ingestion tests and the first client.

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    io,
+    error::Error as StdError,
+    fmt, io,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex, Weak},
     time::Duration,
@@ -13,7 +14,19 @@ use reqwest::{
 };
 use tokio::sync::Semaphore;
 
-use crate::feeds::{MAX_FEED_BYTES, normalize_feed_url};
+use crate::{
+    failure::{Failure, FailureKind},
+    feeds::{MAX_FEED_BYTES, normalize_feed_url},
+};
+
+/// Whole-fetch deadline: slot waits, DNS, one connection retry, redirects, and the body.
+const FETCH_DEADLINE: Duration = Duration::from_secs(40);
+/// hyper-util divides the connect budget across a host's addresses of each
+/// family. Keeping at most two per family leaves each address about five
+/// seconds, enough for TCP to retransmit a dropped SYN after ~1 s and ~3 s.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ADDRS_PER_FAMILY: usize = 2;
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Default)]
 pub struct Validators {
@@ -31,21 +44,6 @@ pub enum FetchResult {
     NotModified {
         validators: Validators,
     },
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct FetchError {
-    pub message: &'static str,
-    pub retry_after_seconds: Option<i64>,
-}
-
-impl FetchError {
-    fn new(message: &'static str) -> Self {
-        Self {
-            message,
-            retry_after_seconds: None,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -76,35 +74,35 @@ impl Fetcher {
         &self,
         input: &str,
         validators: &Validators,
-    ) -> Result<FetchResult, FetchError> {
-        // Includes waiting for slots, DNS, redirects, and streaming the body.
-        tokio::time::timeout(Duration::from_secs(20), self.fetch_inner(input, validators))
+    ) -> Result<FetchResult, Failure> {
+        tokio::time::timeout(FETCH_DEADLINE, self.fetch_inner(input, validators))
             .await
-            .map_err(|_| FetchError::new("feed fetch timed out"))?
+            .map_err(|_| {
+                Failure::new(
+                    FailureKind::DeadlineExceeded,
+                    "feed fetch exceeded 40 seconds",
+                )
+            })?
     }
 
     async fn fetch_inner(
         &self,
         input: &str,
         validators: &Validators,
-    ) -> Result<FetchResult, FetchError> {
-        let _slot = self
-            .slots
-            .acquire()
-            .await
-            .map_err(|_| FetchError::new("fetcher unavailable"))?;
-        let normalized = normalize_feed_url(input).map_err(FetchError::new)?;
-        let mut url = Url::parse(&normalized).map_err(|_| FetchError::new("invalid feed URL"))?;
+    ) -> Result<FetchResult, Failure> {
+        let unavailable = || Failure::new(FailureKind::Internal, "fetcher unavailable");
+        let _slot = self.slots.acquire().await.map_err(|_| unavailable())?;
+        let normalized = normalize_feed_url(input)
+            .map_err(|message| Failure::new(FailureKind::InvalidUrl, message))?;
+        let mut url = Url::parse(&normalized)
+            .map_err(|_| Failure::new(FailureKind::InvalidUrl, "invalid feed URL"))?;
         for redirect in 0..=5 {
             validate_destination(&url)?;
             let host = url
                 .host_str()
-                .ok_or_else(|| FetchError::new("missing host"))?;
+                .ok_or_else(|| Failure::new(FailureKind::InvalidUrl, "feed URL has no host"))?;
             let host_slots = {
-                let mut hosts = self
-                    .hosts
-                    .lock()
-                    .map_err(|_| FetchError::new("fetcher unavailable"))?;
+                let mut hosts = self.hosts.lock().map_err(|_| unavailable())?;
                 hosts.retain(|_, slots| slots.strong_count() > 0);
                 match hosts.get(host).and_then(Weak::upgrade) {
                     Some(slots) => slots,
@@ -115,10 +113,7 @@ impl Fetcher {
                     }
                 }
             };
-            let _host_slot = host_slots
-                .acquire()
-                .await
-                .map_err(|_| FetchError::new("fetcher unavailable"))?;
+            let _host_slot = host_slots.acquire().await.map_err(|_| unavailable())?;
             let mut request = self.client.get(url.clone());
             let mut conditional = false;
             // Validators describe one representation at one URL, not every redirect hop.
@@ -132,28 +127,36 @@ impl Fetcher {
                     conditional = true;
                 }
             }
-            let mut response = request
-                .send()
-                .await
-                .map_err(|_| FetchError::new("feed request failed or destination blocked"))?;
+            let mut response = send_with_retry(request).await?;
             let status = response.status();
             if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
                 if redirect == 5 {
-                    return Err(FetchError::new("too many feed redirects"));
+                    return Err(Failure::new(
+                        FailureKind::TooManyRedirects,
+                        "feed redirected more than 5 times",
+                    ));
                 }
+                let invalid_redirect = || {
+                    Failure::new(
+                        FailureKind::InvalidRedirect,
+                        "redirect Location is missing or not a valid URL",
+                    )
+                };
                 let location = response
                     .headers()
                     .get(header::LOCATION)
                     .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| FetchError::new("invalid redirect location"))?;
-                let next = url
-                    .join(location)
-                    .map_err(|_| FetchError::new("invalid redirect URL"))?;
+                    .ok_or_else(invalid_redirect)?;
+                let next = url.join(location).map_err(|_| invalid_redirect())?;
                 if url.scheme() == "https" && next.scheme() != "https" {
-                    return Err(FetchError::new("HTTPS downgrade redirect blocked"));
+                    return Err(Failure::new(
+                        FailureKind::InsecureRedirect,
+                        "HTTPS to HTTP redirect blocked",
+                    ));
                 }
-                let next = normalize_feed_url(next.as_str()).map_err(FetchError::new)?;
-                url = Url::parse(&next).map_err(|_| FetchError::new("invalid redirect URL"))?;
+                let next = normalize_feed_url(next.as_str())
+                    .map_err(|message| Failure::new(FailureKind::InvalidRedirect, message))?;
+                url = Url::parse(&next).map_err(|_| invalid_redirect())?;
                 continue;
             }
             let received = Validators {
@@ -163,7 +166,10 @@ impl Fetcher {
             };
             if status == StatusCode::NOT_MODIFIED {
                 if !conditional {
-                    return Err(FetchError::new("unexpected unconditional 304 response"));
+                    return Err(Failure::new(
+                        FailureKind::UnexpectedNotModified,
+                        "publisher sent 304 Not Modified to an unconditional request",
+                    ));
                 }
                 return Ok(FetchResult::NotModified {
                     validators: Validators {
@@ -176,8 +182,9 @@ impl Fetcher {
                 });
             }
             if status != StatusCode::OK {
-                return Err(FetchError {
-                    message: "publisher returned an unsuccessful HTTP status",
+                return Err(Failure {
+                    kind: FailureKind::HttpStatus,
+                    message: format!("publisher returned HTTP {status}").into(),
                     retry_after_seconds: if matches!(status.as_u16(), 429 | 503) {
                         header_string(response.headers(), header::RETRY_AFTER)
                             .and_then(|v| retry_after(&v))
@@ -186,31 +193,40 @@ impl Fetcher {
                     },
                 });
             }
-            // Request identity encoding and reject unsolicited compressed responses.
-            // This bounds both wire bytes and parser input without decompression bombs.
-            if response
+            // Reqwest decodes gzip and removes its header. Any encoding left
+            // here was not requested and cannot be bounded, so reject it.
+            if let Some(encoding) = response
                 .headers()
                 .get(header::CONTENT_ENCODING)
-                .is_some_and(|v| v != "identity")
+                .filter(|v| *v != "identity")
             {
-                return Err(FetchError::new(
-                    "compressed feed response is not supported yet",
+                let encoding = encoding
+                    .to_str()
+                    .ok()
+                    .filter(|v| v.len() <= 32)
+                    .unwrap_or("unknown");
+                return Err(Failure::new(
+                    FailureKind::UnsupportedEncoding,
+                    format!("publisher used unsupported compression: {encoding}"),
                 ));
             }
+            let too_large = || Failure::new(FailureKind::TooLarge, "feed response exceeds 16 MiB");
             if response
                 .content_length()
                 .is_some_and(|n| n > MAX_FEED_BYTES as u64)
             {
-                return Err(FetchError::new("feed response exceeds 1 MiB"));
+                return Err(too_large());
             }
+            // Chunks arrive decompressed, so this bounds the expanded size and
+            // stops reading a compression bomb as soon as it crosses the limit.
             let mut body = Vec::new();
             while let Some(chunk) = response
                 .chunk()
                 .await
-                .map_err(|_| FetchError::new("feed body read failed"))?
+                .map_err(|error| body_failure(&error))?
             {
                 if body.len().saturating_add(chunk.len()) > MAX_FEED_BYTES {
-                    return Err(FetchError::new("feed response exceeds 1 MiB"));
+                    return Err(too_large());
                 }
                 body.extend_from_slice(&chunk);
             }
@@ -219,7 +235,91 @@ impl Fetcher {
                 validators: received,
             });
         }
-        Err(FetchError::new("too many feed redirects"))
+        Err(Failure::new(
+            FailureKind::TooManyRedirects,
+            "feed redirected more than 5 times",
+        ))
+    }
+}
+
+/// Retries once when no connection could be made. The request was never
+/// delivered in that case, so repeating it is safe.
+async fn send_with_retry(request: reqwest::RequestBuilder) -> Result<reqwest::Response, Failure> {
+    let retry = request.try_clone();
+    let failure = match request.send().await {
+        Ok(response) => return Ok(response),
+        Err(error) => classify(&error),
+    };
+    match (failure.kind, retry) {
+        (FailureKind::ConnectTimeout | FailureKind::ConnectFailed, Some(retry)) => {
+            tracing::info!(code = failure.code(), "retrying feed connection once");
+            tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+            retry.send().await.map_err(|error| classify(&error))
+        }
+        _ => Err(failure),
+    }
+}
+
+fn classify(error: &reqwest::Error) -> Failure {
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(dns) = cause.downcast_ref::<DnsError>() {
+            return dns.failure();
+        }
+        if error.is_connect() && cause.downcast_ref::<io::Error>().is_some_and(is_tls_error) {
+            return Failure::new(
+                FailureKind::TlsFailed,
+                "TLS handshake with the feed server failed",
+            );
+        }
+        source = cause.source();
+    }
+    match (error.is_connect(), error.is_timeout()) {
+        (true, true) => Failure::new(
+            FailureKind::ConnectTimeout,
+            "timed out connecting to the feed server",
+        ),
+        (true, false) => Failure::new(
+            FailureKind::ConnectFailed,
+            "could not connect to the feed server",
+        ),
+        (false, true) => Failure::new(
+            FailureKind::ResponseTimeout,
+            "feed server did not respond within 15 seconds",
+        ),
+        (false, false) => Failure::new(
+            FailureKind::BodyReadFailed,
+            "feed server closed the connection before responding",
+        ),
+    }
+}
+
+// TLS handshake failures are InvalidData I/O errors, nested inside an `Other`
+// I/O error. `io::Error::source` skips the wrapped error, so unwrap it directly.
+fn is_tls_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidData
+        || error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<io::Error>())
+            .is_some_and(is_tls_error)
+}
+
+fn body_failure(error: &reqwest::Error) -> Failure {
+    if error.is_decode() {
+        Failure::new(
+            FailureKind::DecompressFailed,
+            "feed body could not be decompressed",
+        )
+    } else if error.is_timeout() {
+        Failure::new(
+            FailureKind::ResponseTimeout,
+            "feed body did not finish downloading within 15 seconds",
+        )
+    } else {
+        Failure::new(
+            FailureKind::BodyReadFailed,
+            "connection dropped while downloading the feed",
+        )
     }
 }
 
@@ -228,13 +328,14 @@ fn client_builder() -> reqwest::ClientBuilder {
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .referer(false)
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(CONNECT_TIMEOUT)
         .timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(2)
-        .no_gzip().no_brotli().no_deflate().no_zstd()
+        // Reqwest sends `Accept-Encoding: gzip` and decodes the body as it streams.
+        .gzip(true)
+        .no_brotli().no_deflate().no_zstd()
         .user_agent(concat!("rss-backend/", env!("CARGO_PKG_VERSION")))
         .default_headers([
-            (header::ACCEPT_ENCODING, header::HeaderValue::from_static("identity")),
             (header::ACCEPT, header::HeaderValue::from_static("application/atom+xml, application/rss+xml, application/feed+json, application/xml, text/xml, application/json")),
         ].into_iter().collect())
 }
@@ -256,20 +357,28 @@ fn retry_after(value: &str) -> Option<i64> {
     Some(seconds.clamp(30, 86_400))
 }
 
-fn validate_destination(url: &Url) -> Result<(), FetchError> {
-    normalize_feed_url(url.as_str()).map_err(FetchError::new)?;
+fn validate_destination(url: &Url) -> Result<(), Failure> {
+    normalize_feed_url(url.as_str())
+        .map_err(|message| Failure::new(FailureKind::InvalidUrl, message))?;
     // A deliberately small public-web port policy for the initial fetcher.
     if !matches!(url.port_or_known_default(), Some(80 | 443)) {
-        return Err(FetchError::new("feed destination port must be 80 or 443"));
+        return Err(Failure::new(
+            FailureKind::BlockedPort,
+            "feed destination port must be 80 or 443",
+        ));
     }
-    match url.host() {
-        Some(url::Host::Ipv4(ip)) if !public_ip(IpAddr::V4(ip)) => {
-            Err(FetchError::new("non-public feed destination blocked"))
-        }
-        Some(url::Host::Ipv6(ip)) if !public_ip(IpAddr::V6(ip)) => {
-            Err(FetchError::new("non-public feed destination blocked"))
-        }
-        _ => Ok(()),
+    let public = match url.host() {
+        Some(url::Host::Ipv4(ip)) => public_ip(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => public_ip(IpAddr::V6(ip)),
+        _ => true,
+    };
+    if public {
+        Ok(())
+    } else {
+        Err(Failure::new(
+            FailureKind::BlockedDestination,
+            "feed address is private or reserved",
+        ))
     }
 }
 
@@ -298,20 +407,57 @@ fn public_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Resolver errors carry their cause through hyper so `classify` can tell a
+/// blocked destination from a name that does not resolve.
+#[derive(Debug)]
+enum DnsError {
+    LookupFailed,
+    Blocked,
+}
+
+impl DnsError {
+    fn failure(&self) -> Failure {
+        match self {
+            Self::LookupFailed => Failure::new(
+                FailureKind::DnsFailed,
+                "could not resolve the feed's host name",
+            ),
+            Self::Blocked => Failure::new(
+                FailureKind::BlockedDestination,
+                "feed host resolves only to private or reserved addresses",
+            ),
+        }
+    }
+}
+
+impl fmt::Display for DnsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.failure().message)
+    }
+}
+
+impl StdError for DnsError {}
+
 struct PublicResolver;
 
 // Drop non-public answers instead of rejecting the host: DNS64 networks add
 // 64:ff9b:: addresses beside public IPv4 ones. Only public addresses are dialed.
-fn validated_addresses(addresses: Vec<SocketAddr>) -> Result<Addrs, io::Error> {
+fn validated_addresses(addresses: Vec<SocketAddr>) -> Result<Addrs, DnsError> {
+    if addresses.is_empty() {
+        return Err(DnsError::LookupFailed);
+    }
+    let (mut v4, mut v6) = (0, 0);
     let public: Vec<SocketAddr> = addresses
         .into_iter()
         .filter(|address| public_ip(address.ip()))
+        .filter(|address| {
+            let count = if address.is_ipv4() { &mut v4 } else { &mut v6 };
+            *count += 1;
+            *count <= MAX_ADDRS_PER_FAMILY
+        })
         .collect();
     if public.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "non-public DNS result blocked",
-        ));
+        return Err(DnsError::Blocked);
     }
     Ok(Box::new(public.into_iter()))
 }
@@ -319,8 +465,10 @@ fn validated_addresses(addresses: Vec<SocketAddr>) -> Result<Addrs, io::Error> {
 impl Resolve for PublicResolver {
     fn resolve(&self, name: Name) -> Resolving {
         Box::pin(async move {
-            let addresses: Vec<SocketAddr> =
-                tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            let addresses: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), 0))
+                .await
+                .map_err(|_| DnsError::LookupFailed)?
+                .collect();
             // Return the validated addresses directly to the connector; it does
             // not perform an independent second lookup that could be rebound.
             Ok(validated_addresses(addresses)?)
@@ -339,9 +487,34 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
     #[test]
     fn blocks_special_addresses_and_ports() {
-        assert!(validated_addresses(vec![]).is_err());
+        assert!(matches!(
+            validated_addresses(vec![]),
+            Err(DnsError::LookupFailed)
+        ));
+        let capped: Vec<SocketAddr> = validated_addresses(
+            [
+                "1.1.1.1:0",
+                "1.0.0.1:0",
+                "8.8.8.8:0",
+                "[2606:4700::1]:0",
+                "[2606:4700::2]:0",
+                "[2606:4700::3]:0",
+            ]
+            .map(|a| a.parse().unwrap())
+            .to_vec(),
+        )
+        .unwrap()
+        .collect();
+        assert_eq!(capped.len(), 4);
         assert!(
             validated_addresses(vec![
                 "127.0.0.1:0".parse().unwrap(),
@@ -426,10 +599,23 @@ mod tests {
                             Ok::<_, io::Error>(vec![b'x'; MAX_FEED_BYTES / 2]),
                             Ok(vec![b'x'; MAX_FEED_BYTES / 2 + 1]),
                         ]))),
-                        "/compressed" => Response::builder()
+                        "/gzip" => Response::builder()
                             .header("content-encoding", "gzip")
+                            .body(Body::from(gzip(b"feed bytes")))
+                            .unwrap(),
+                        "/bomb" => Response::builder()
+                            .header("content-encoding", "gzip")
+                            .body(Body::from(gzip(&vec![0; MAX_FEED_BYTES + 1])))
+                            .unwrap(),
+                        "/corrupt" => Response::builder()
+                            .header("content-encoding", "gzip")
+                            .body(Body::from("not gzip"))
+                            .unwrap(),
+                        "/brotli" => Response::builder()
+                            .header("content-encoding", "br")
                             .body(Body::from("bytes"))
                             .unwrap(),
+                        "/missing" => Response::builder().status(404).body(Body::empty()).unwrap(),
                         "/unconditional" => {
                             Response::builder().status(304).body(Body::empty()).unwrap()
                         }
@@ -469,26 +655,49 @@ mod tests {
                 .unwrap(),
             FetchResult::NotModified { .. }
         ));
-        for path in ["redirect", "large", "compressed", "unconditional"] {
-            assert!(
-                fetcher
-                    .fetch(
-                        &format!("http://fixture.test/{path}"),
-                        &Validators::default()
-                    )
-                    .await
-                    .is_err()
-            );
-        }
-        assert_eq!(
-            fetcher
-                .fetch("http://fixture.test/limited", &Validators::default())
+        let FetchResult::Modified { body, .. } = fetcher
+            .fetch("http://fixture.test/gzip", &Validators::default())
+            .await
+            .unwrap()
+        else {
+            panic!("expected body")
+        };
+        assert_eq!(body, b"feed bytes");
+        // Different causes must never share a message.
+        let mut messages = HashMap::new();
+        for (path, kind) in [
+            ("redirect", FailureKind::BlockedDestination),
+            ("large", FailureKind::TooLarge),
+            ("bomb", FailureKind::TooLarge),
+            ("corrupt", FailureKind::DecompressFailed),
+            ("brotli", FailureKind::UnsupportedEncoding),
+            ("unconditional", FailureKind::UnexpectedNotModified),
+            ("missing", FailureKind::HttpStatus),
+        ] {
+            let failure = fetcher
+                .fetch(
+                    &format!("http://fixture.test/{path}"),
+                    &Validators::default(),
+                )
                 .await
-                .unwrap_err()
-                .retry_after_seconds,
-            Some(120)
+                .unwrap_err();
+            assert_eq!(failure.kind, kind, "{path}: {}", failure.message);
+            let code = messages
+                .entry(failure.message.clone())
+                .or_insert(failure.code());
+            assert_eq!(*code, failure.code(), "{path}");
+        }
+        assert!(messages.contains_key("publisher returned HTTP 404 Not Found"));
+        let limited = fetcher
+            .fetch("http://fixture.test/limited", &Validators::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            limited.message,
+            "publisher returned HTTP 429 Too Many Requests"
         );
-        assert_eq!(seen.load(Ordering::SeqCst), 7);
+        assert_eq!(limited.retry_after_seconds, Some(120));
+        assert_eq!(seen.load(Ordering::SeqCst), 11);
         server.abort();
     }
 
@@ -575,7 +784,7 @@ mod tests {
                 0 => assert_eq!(report["inserted"], 1),
                 1 => assert_eq!(report["not_modified"], true),
                 2 => assert_eq!(report["updated"], 1),
-                _ => assert!(report["error"].is_string()),
+                _ => assert_eq!(report["code"], "parse_failed"),
             }
         }
         let response = app

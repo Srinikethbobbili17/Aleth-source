@@ -4,7 +4,10 @@ use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool};
 use url::Url;
 
-use crate::feeds::{normalize_feed_url, validate_content};
+use crate::{
+    failure::{Failure, FailureKind},
+    feeds::{normalize_feed_url, validate_content},
+};
 
 #[derive(Debug)]
 pub struct ParsedFeed {
@@ -32,9 +35,10 @@ pub struct ArticleData {
     pub source_updated_at: Option<DateTime<Utc>>,
 }
 
-pub fn parse(content: &[u8], source_url: &str) -> Result<ParsedFeed, &'static str> {
+pub fn parse(content: &[u8], source_url: &str) -> Result<ParsedFeed, Failure> {
     validate_content(content)?;
-    let base = Url::parse(source_url).map_err(|_| "invalid feed source URL")?;
+    let base = Url::parse(source_url)
+        .map_err(|_| Failure::new(FailureKind::InvalidUrl, "invalid feed source URL"))?;
     let parsed = feed_rs::parser::Builder::new()
         .base_uri(Some(source_url))
         // Preserve missing IDs rather than accepting feed-rs' random fallback.
@@ -42,9 +46,17 @@ pub fn parse(content: &[u8], source_url: &str) -> Result<ParsedFeed, &'static st
         .sanitize_content(true)
         .build()
         .parse(content)
-        .map_err(|_| "could not parse feed content")?;
+        .map_err(|_| {
+            Failure::new(
+                FailureKind::ParseFailed,
+                "could not parse RSS, Atom, or JSON Feed content",
+            )
+        })?;
     if parsed.entries.len() > 1000 {
-        return Err("feed exceeds 1000 entries");
+        return Err(Failure::new(
+            FailureKind::TooManyEntries,
+            "feed has more than 1000 entries",
+        ));
     }
     let mut entries = Vec::with_capacity(parsed.entries.len());
     let mut identities = std::collections::HashSet::new();
@@ -94,7 +106,9 @@ pub fn parse(content: &[u8], source_url: &str) -> Result<ParsedFeed, &'static st
             source_updated_at: entry.updated,
         };
         let content_hash =
-            hash(&serde_json::to_vec(&data).map_err(|_| "could not normalize feed item")?);
+            hash(&serde_json::to_vec(&data).map_err(|_| {
+                Failure::new(FailureKind::Internal, "could not normalize feed item")
+            })?);
         let identity = if let Some(id) = &data.external_id {
             format!("id:{}", hash(id.as_bytes()))
         } else if let Some(url) = &data.url {

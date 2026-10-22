@@ -246,13 +246,13 @@ Expected application errors include 404 for a missing resource, 409 for refresh 
 | Concurrent refresh requests | 4 per application instance |
 | Requests to one hostname | 2 per shared fetcher instance |
 | Concurrent parsing tasks | 2 per application instance |
-| Connection timeout | 5 seconds |
+| Connection timeout | 10 seconds for DNS, TCP, and TLS; at most two addresses per IP family; one retry after 500 ms |
 | Per-request HTTP timeout | 15 seconds |
-| Whole fetch deadline | 20 seconds, including slot waiting, redirects, and body streaming |
+| Whole fetch deadline | 40 seconds, including slot waiting, a connection retry, redirects, and body streaming |
 | Redirects | At most 5; HTTPS downgrade redirects rejected |
-| Downloaded feed size | At most 1 MiB, including streamed responses without a declared size |
+| Downloaded feed size | At most 16 MiB after gzip decompression, including streamed responses without a declared size |
 | Entries in a parsed feed | At most 1,000 |
-| XML structure | At most 64 nesting levels and 50,000 events; document types rejected |
+| XML structure | At most 64 nesting levels and 4,194,304 events (scaled to the size limit); document types rejected |
 | Preview request body | At most 2 MiB of JSON containing at most 1 MiB of decoded feed text |
 | Refresh lease | 90 seconds |
 | Successful manual refresh cooldown | 30 seconds |
@@ -261,7 +261,7 @@ Expected application errors include 404 for a missing resource, 409 for refresh 
 
 The fetcher requests uncompressed content and rejects compressed responses. It permits HTTP(S) on ports 80 and 443, disables environment proxies, and uses a conservative public-address policy. DNS results are validated and passed to the connector without a second independent lookup. These choices constrain what arbitrary feed URLs can cause the server to contact.
 
-The 20-second deadline covers fetching, not the complete refresh transaction. SQL statements during persistence have individual timeouts; an overall refresh/shutdown budget is still a useful improvement.
+The 40-second deadline covers fetching, not the complete refresh transaction. SQL statements during persistence have individual timeouts; an overall refresh/shutdown budget is still a useful improvement.
 
 Concurrency limits are mostly local to one process. Starting several API or worker instances would multiply their outbound capacity. The database lease still coordinates ownership of the same feed, but different feeds on the same publisher need deployment-wide fairness if workers are scaled out.
 
@@ -360,7 +360,7 @@ Keep the current synchronous refresh API working initially. If manual refresh la
 
 Build a corpus of 10–20 public feeds that represent what you actually read. Include RSS, Atom, JSON Feed, missing IDs/dates, relative URLs, repeated IDs, source updates, redirects, and empty feeds.
 
-Add bounded gzip decompression with separate limits for bytes received and bytes expanded. Keep destination checks active on every hop. Add deterministic tests for slow responses, redirect loops, changed redirect targets, and cancellation. Keep hardware/network-dependent timing tests conservative.
+Bounded gzip decompression is implemented. Keep destination checks active on every hop. Add deterministic tests for slow responses, redirect loops, changed redirect targets, and cancellation. Keep hardware/network-dependent timing tests conservative.
 
 Standardize API errors, add request IDs and an OpenAPI contract, and make limits configurable with safe defaults. Record useful failure categories and HTTP status without recording token-bearing URLs or raw article content. Add a version-history endpoint if the client needs to display corrections.
 
