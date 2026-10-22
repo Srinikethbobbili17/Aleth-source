@@ -25,6 +25,8 @@ services:
       DATABASE_URL: postgres://rss:${POSTGRES_PASSWORD:-rss_dev_password}@postgres:5432/rss
       BIND_ADDR: 0.0.0.0:3000
       RUST_LOG: ${RUST_LOG:-rss_backend=info,tower_http=info}
+      POLLING: ${POLLING:-true}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-1800}
     # The API has no authentication yet, so publish it on this machine only.
     ports:
       - "127.0.0.1:3000:3000"

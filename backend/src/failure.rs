@@ -28,6 +28,8 @@ pub enum FailureKind {
     XmlTooDeep,
     XmlTooComplex,
     ParseFailed,
+    InvalidOpml,
+    TooManyFeeds,
     Internal,
 }
 
@@ -57,6 +59,8 @@ impl FailureKind {
             Self::XmlTooDeep => "xml_too_deep",
             Self::XmlTooComplex => "xml_too_complex",
             Self::ParseFailed => "parse_failed",
+            Self::InvalidOpml => "invalid_opml",
+            Self::TooManyFeeds => "too_many_feeds",
             Self::Internal => "internal",
         }
     }

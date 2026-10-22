@@ -153,3 +153,36 @@ async fn every_rejection_is_json_with_a_code() {
         assert!(body["error"].is_string(), "{uri}");
     }
 }
+
+#[tokio::test]
+async fn invalid_opml_is_rejected_before_database_access() {
+    let app = router(unavailable_database());
+    for (body, code) in [
+        ("<rss/>", "invalid_opml"),
+        ("not xml", "invalid_opml"),
+        (
+            r#"<!DOCTYPE opml [<!ENTITY x "y">]><opml/>"#,
+            "unsupported_xml",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/imports/opml")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}"
+        );
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], code);
+    }
+}

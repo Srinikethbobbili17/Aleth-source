@@ -97,7 +97,12 @@ pub struct Feed {
     pub created_at: DateTime<Utc>,
     pub last_fetched_at: Option<DateTime<Utc>>,
     pub last_success_at: Option<DateTime<Utc>>,
-    pub next_fetch_at: DateTime<Utc>,
+    /// When automatic polling will next refresh this feed.
+    pub next_poll_at: DateTime<Utc>,
+    /// Manual refreshes are refused until then (short cooldown after a refresh).
+    pub manual_refresh_after: Option<DateTime<Utc>>,
+    /// After a failure, no refresh of any kind runs before this time.
+    pub retry_not_before: Option<DateTime<Utc>>,
     pub failure_count: i32,
     pub last_error: Option<String>,
     pub last_error_code: Option<String>,
@@ -130,16 +135,63 @@ pub async fn register(pool: &PgPool, url: &str) -> Result<Feed, sqlx::Error> {
     sqlx::query_as(
         "INSERT INTO feeds (url) VALUES ($1) \
          ON CONFLICT (url) DO UPDATE SET url = EXCLUDED.url \
-         RETURNING id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code, dead_at",
+         RETURNING id, url, title, created_at, last_fetched_at, last_success_at, next_poll_at, manual_refresh_after, retry_not_before, failure_count, last_error, last_error_code, dead_at",
     )
     .bind(url)
     .fetch_one(pool)
     .await
 }
 
+/// Registers many normalized URLs at once, in the given order. Returns each
+/// URL's feed ID and whether this call added it. New feeds are due for
+/// polling immediately.
+pub async fn register_many(
+    pool: &PgPool,
+    urls: &[String],
+) -> Result<std::collections::HashMap<String, (i64, bool)>, sqlx::Error> {
+    // Statements in one WITH query share a snapshot, so the final SELECT sees
+    // only feeds that existed before; the INSERT's RETURNING covers new ones.
+    let rows: Vec<(String, i64, bool)> = sqlx::query_as(
+        "WITH input AS (SELECT url, n FROM unnest($1::text[]) WITH ORDINALITY AS t(url, n)), \
+         added AS (INSERT INTO feeds (url) SELECT url FROM input ORDER BY n \
+                   ON CONFLICT (url) DO NOTHING RETURNING id, url) \
+         SELECT url, id, true FROM added \
+         UNION ALL SELECT f.url, f.id, false FROM feeds f JOIN input USING (url)",
+    )
+    .bind(urls)
+    .fetch_all(pool)
+    .await?;
+    let mut feeds: std::collections::HashMap<String, (i64, bool)> = rows
+        .into_iter()
+        .map(|(url, id, added)| (url, (id, added)))
+        .collect();
+    // A concurrent registration can commit between our snapshot and INSERT;
+    // its URLs appear in neither result, so look them up directly.
+    let missing: Vec<&String> = urls
+        .iter()
+        .filter(|url| !feeds.contains_key(*url))
+        .collect();
+    if !missing.is_empty() {
+        let found: Vec<(String, i64)> =
+            sqlx::query_as("SELECT url, id FROM feeds WHERE url = ANY($1)")
+                .bind(&missing)
+                .fetch_all(pool)
+                .await?;
+        feeds.extend(found.into_iter().map(|(url, id)| (url, (id, false))));
+    }
+    Ok(feeds)
+}
+
+/// Every registered feed's URL and title, oldest first, for export.
+pub async fn all_urls(pool: &PgPool) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
+    sqlx::query_as("SELECT url, title FROM feeds ORDER BY id")
+        .fetch_all(pool)
+        .await
+}
+
 pub async fn list(pool: &PgPool, after_id: i64, limit: i64) -> Result<Vec<Feed>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code, dead_at FROM feeds \
+        "SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_poll_at, manual_refresh_after, retry_not_before, failure_count, last_error, last_error_code, dead_at FROM feeds \
          WHERE id > $1 ORDER BY id LIMIT $2",
     )
     .bind(after_id)
@@ -149,7 +201,7 @@ pub async fn list(pool: &PgPool, after_id: i64, limit: i64) -> Result<Vec<Feed>,
 }
 
 pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Feed>, sqlx::Error> {
-    sqlx::query_as("SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_fetch_at, failure_count, last_error, last_error_code, dead_at FROM feeds WHERE id = $1")
+    sqlx::query_as("SELECT id, url, title, created_at, last_fetched_at, last_success_at, next_poll_at, manual_refresh_after, retry_not_before, failure_count, last_error, last_error_code, dead_at FROM feeds WHERE id = $1")
         .bind(id).fetch_optional(pool).await
 }
 

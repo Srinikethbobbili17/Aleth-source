@@ -42,23 +42,27 @@ The backend is ready for a TUI when all of these hold:
 - [x] **Dead feeds:** `dead_at` set after 10 consecutive failures; a successful manual refresh revives the feed.
 - [ ] **Very large feeds over 16 MiB** (for example The Daily, 19.6 MiB) still fail with `too_large`. Decide whether to raise the cap or make limits configurable.
 - [ ] **YouTube descriptions** (`media:description`).
-- [ ] **Add a `*/*` fallback to the `Accept` header** so strict publishers do not reject requests.
+- [x] **`*/*` fallback in the `Accept` header** so strict publishers do not answer 406.
 - [ ] **Build a real-feed corpus.** Register the 10–20 feeds you actually read, refresh them all, and note every failure.
 
 ## Phase 2: Automatic polling
 
-- [ ] Migration that splits `next_fetch_at` into `next_poll_at`, `manual_refresh_after`, and `retry_not_before`
-- [ ] Refactor `ingest.rs` so a caller that already claimed a feed can run the refresh with that claim
-- [ ] `scheduler.rs`: claim due feeds in batches with `FOR UPDATE SKIP LOCKED`
-- [ ] Worker loop with a polling interval plus jitter, clean shutdown, and recovery of expired leases after restart
-- [ ] Tests: restart recovery, two workers never persisting the same lease, a slow feed not blocking others
+- [x] Migration 0005 splits `next_fetch_at` into `next_poll_at`, `manual_refresh_after`, and `retry_not_before`; distinct `cooling_down` and `retry_backoff` errors
+- [x] `ingest.rs` refactored into claim + run around a shared `Refresher`, used by the API and the scheduler
+- [x] `scheduler.rs`: claims due feeds in batches with `FOR UPDATE SKIP LOCKED`, skips dead and backing-off feeds
+- [x] Polling interval (`POLL_INTERVAL_SECONDS`, default 30 min) with ±10% jitter, one slot reserved for manual refreshes, clean shutdown with a 30 s drain, expired-lease recovery
+- [x] Tests: concurrent claimers never share a feed, expired leases are reclaimed, a slow feed does not block others, shutdown drains in-flight work
+- [x] CI warning fixed: `actions/checkout@v7` (Node.js 24)
 - [ ] Run unattended for a day against the feed corpus and record failures and lag
+- [ ] Publication-aware intervals: poll frequently updated feeds more often, quiet ones less
+- [ ] Metrics for due-feed lag (how late polls run) and scheduler throughput
 
 ## Phase 3: Ingestion correctness and efficiency
 
-- [ ] Store the redirected URL after permanent (301/308) redirects
-- [ ] Stop `<updated>`-only changes from creating a new article version on each fetch
-- [ ] Batch the per-article SQL inside the refresh transaction
+- [x] Store the redirected URL after permanent (301/308) redirects
+- [x] Stop `<updated>`-only changes from creating a new article version (legacy fingerprints upgrade in place, verified on the trial's 2,690 articles)
+- [x] Batch the per-article SQL inside the refresh transaction (1,000-entry save: 3.8 s → 1.05 s in the test suite)
+- [ ] Trial finding to review: hnrss.org summaries embed live points/comment counts, so Hacker News items gain a version on most polls
 - [ ] Article version-history endpoint
 - [ ] Retention policy for old versions and items
 
@@ -72,7 +76,9 @@ The backend is ready for a TUI when all of these hold:
 
 - [ ] Read/unread, starred, and saved state per account, kept separate from article content
 - [ ] Folders, subscription rename/remove
-- [ ] OPML import (with per-feed errors) and export
+- [x] OPML import: `POST /v1/imports/opml` with per-feed status, folders, duplicates, and rejected URLs; imported feeds are fetched by the scheduler within seconds
+- [x] OPML export: `GET /v1/exports/opml`; round-trips through import
+- [ ] Store OPML folders once folders exist
 - [ ] PostgreSQL full-text search over accessible articles
 - [ ] Change feed or sync cursor so clients can fetch "what changed since X"
 

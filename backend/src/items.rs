@@ -20,8 +20,27 @@ pub struct ParsedFeed {
 #[derive(Debug)]
 pub struct NormalizedEntry {
     pub identity: String,
+    /// Fingerprint of the article's content, ignoring the publisher's
+    /// `updated` timestamp, which some feeds change on every fetch.
     pub content_hash: String,
+    /// The earlier fingerprint, which also covered timestamps. Versions stored
+    /// before the change still carry it; a match counts as unchanged.
+    pub legacy_hash: String,
     pub data: ArticleData,
+}
+
+/// The fields whose change makes a new version. The publication date is the
+/// publisher's own `published`, not the fallback to `updated`.
+#[derive(Serialize)]
+struct Fingerprint<'a> {
+    external_id: &'a Option<String>,
+    title: &'a Option<String>,
+    url: &'a Option<String>,
+    authors: &'a [String],
+    summary: &'a Option<String>,
+    content: &'a Option<String>,
+    content_type: &'a Option<String>,
+    published: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -59,6 +78,7 @@ pub fn parse(content: &[u8], source_url: &str) -> Result<ParsedFeed, Failure> {
     let mut identities = std::collections::HashSet::new();
     for entry in latest {
         let published_at = entry_date(&entry);
+        let published = entry.published;
         let url = entry
             .links
             .iter()
@@ -103,10 +123,22 @@ pub fn parse(content: &[u8], source_url: &str) -> Result<ParsedFeed, Failure> {
             published_at,
             source_updated_at: entry.updated,
         };
-        let content_hash =
-            hash(&serde_json::to_vec(&data).map_err(|_| {
-                Failure::new(FailureKind::Internal, "could not normalize feed item")
-            })?);
+        let normalize_failed =
+            |_| Failure::new(FailureKind::Internal, "could not normalize feed item");
+        let legacy_hash = hash(&serde_json::to_vec(&data).map_err(normalize_failed)?);
+        let content_hash = hash(
+            &serde_json::to_vec(&Fingerprint {
+                external_id: &data.external_id,
+                title: &data.title,
+                url: &data.url,
+                authors: &data.authors,
+                summary: &data.summary,
+                content: &data.content,
+                content_type: &data.content_type,
+                published,
+            })
+            .map_err(normalize_failed)?,
+        );
         let identity = if let Some(id) = &data.external_id {
             format!("id:{}", hash(id.as_bytes()))
         } else if let Some(url) = &data.url {
@@ -114,13 +146,15 @@ pub fn parse(content: &[u8], source_url: &str) -> Result<ParsedFeed, Failure> {
         } else {
             // With no persistent ID or link, content changes cannot safely be
             // attributed to an existing item. Identical snapshots remain stable.
-            format!("content:{content_hash}")
+            // Kept on the legacy hash so stored identities do not change.
+            format!("content:{legacy_hash}")
         };
         // First occurrence wins when a publisher repeats an ID in one document.
         if identities.insert(identity.clone()) {
             entries.push(NormalizedEntry {
                 identity,
                 content_hash,
+                legacy_hash,
                 data,
             });
         }

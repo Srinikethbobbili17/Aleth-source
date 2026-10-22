@@ -1,30 +1,29 @@
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, time::Duration};
 
 use axum::{
     Json, Router,
     extract::{
         DefaultBodyLimit, FromRequest, FromRequestParts, State,
-        rejection::{JsonRejection, PathRejection, QueryRejection},
+        rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection},
     },
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use tokio::sync::Semaphore;
 use tower_http::trace::TraceLayer;
 
-use crate::{failure::Failure, feeds, fetch::Fetcher, ingest, items};
+use crate::{
+    config::DEFAULT_POLL_INTERVAL,
+    failure::Failure,
+    feeds,
+    fetch::Fetcher,
+    ingest::{self, Refresher},
+    items, opml,
+};
 
-#[derive(Clone)]
-struct AppState {
-    pool: PgPool,
-    parser_slots: Arc<Semaphore>,
-    refresh_slots: Arc<Semaphore>,
-    fetcher: Fetcher,
-}
-
+/// A router with its own refresh machinery and the default poll interval.
 pub fn router(pool: PgPool) -> Router {
     router_with_fetcher(
         pool,
@@ -33,6 +32,12 @@ pub fn router(pool: PgPool) -> Router {
 }
 
 pub(crate) fn router_with_fetcher(pool: PgPool, fetcher: Fetcher) -> Router {
+    router_with(Refresher::new(pool, fetcher, DEFAULT_POLL_INTERVAL))
+}
+
+/// A router sharing `refresher` with the scheduler, so manual and automatic
+/// refreshes draw on the same capacity.
+pub fn router_with(refresher: Refresher) -> Router {
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
@@ -42,20 +47,17 @@ pub(crate) fn router_with_fetcher(pool: PgPool, fetcher: Fetcher) -> Router {
         .route("/v1/items", get(list_items))
         .route("/v1/items/{id}", get(get_item))
         .route("/v1/feed-preview", post(preview_feed))
+        .route("/v1/imports/opml", post(import_opml))
+        .route("/v1/exports/opml", get(export_opml))
         .fallback(route_not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
-        .with_state(AppState {
-            pool,
-            parser_slots: Arc::new(Semaphore::new(2)),
-            refresh_slots: Arc::new(Semaphore::new(4)),
-            fetcher,
-        })
+        .with_state(refresher)
 }
 
 async fn get_feed(
-    State(state): State<AppState>,
+    State(state): State<Refresher>,
     ApiPath(id): ApiPath<i64>,
 ) -> Result<Json<feeds::Feed>, ApiError> {
     positive_id(id)?;
@@ -71,56 +73,60 @@ async fn get_feed(
 }
 
 async fn refresh_feed(
-    State(state): State<AppState>,
+    State(state): State<Refresher>,
     ApiPath(id): ApiPath<i64>,
 ) -> Result<Json<ingest::RefreshReport>, ApiError> {
     positive_id(id)?;
-    let _permit = state.refresh_slots.try_acquire_owned().map_err(|_| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "capacity_busy",
-            "refresh capacity busy; retry later",
-        )
-    })?;
-    ingest::refresh(&state.pool, &state.fetcher, state.parser_slots, id)
-        .await
-        .map(Json)
-        .map_err(|error| {
-            use ingest::RefreshError;
-            match error {
-                RefreshError::NotFound => {
-                    ApiError::new(StatusCode::NOT_FOUND, "not_found", "feed not found")
-                }
-                RefreshError::Busy => ApiError::new(
-                    StatusCode::CONFLICT,
-                    "refresh_busy",
-                    "this feed is already being refreshed",
-                ),
-                RefreshError::ParserBusy => ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "parser_busy",
-                    "parser capacity busy; retry later",
-                ),
-                RefreshError::CoolingDown => ApiError::new(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "cooling_down",
-                    "feed is cooling down; check next_fetch_at",
-                ),
-                RefreshError::LeaseExpired => ApiError::new(
-                    StatusCode::CONFLICT,
-                    "lease_expired",
-                    "refresh lease expired; retry later",
-                ),
-                RefreshError::Upstream(failure) => {
-                    ApiError::failure(StatusCode::BAD_GATEWAY, failure)
-                }
-                RefreshError::Database => ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "database_unavailable",
-                    "database unavailable",
-                ),
+    let _permit = state
+        .refresh_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "capacity_busy",
+                "refresh capacity busy; retry later",
+            )
+        })?;
+    state.refresh_now(id).await.map(Json).map_err(|error| {
+        use ingest::RefreshError;
+        match error {
+            RefreshError::NotFound => {
+                ApiError::new(StatusCode::NOT_FOUND, "not_found", "feed not found")
             }
-        })
+            RefreshError::Busy => ApiError::new(
+                StatusCode::CONFLICT,
+                "refresh_busy",
+                "this feed is already being refreshed",
+            ),
+            RefreshError::ParserBusy => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "parser_busy",
+                "parser capacity busy; retry later",
+            ),
+            RefreshError::CoolingDown => ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "cooling_down",
+                "feed was refreshed recently; retry after manual_refresh_after",
+            ),
+            RefreshError::BackingOff => ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "retry_backoff",
+                "feed failed recently; retry after retry_not_before",
+            ),
+            RefreshError::LeaseExpired => ApiError::new(
+                StatusCode::CONFLICT,
+                "lease_expired",
+                "refresh lease expired; retry later",
+            ),
+            RefreshError::Upstream(failure) => ApiError::failure(StatusCode::BAD_GATEWAY, failure),
+            RefreshError::Database => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database_unavailable",
+                "database unavailable",
+            ),
+        }
+    })
 }
 
 fn positive_id(id: i64) -> Result<(), ApiError> {
@@ -147,7 +153,7 @@ struct ItemPage {
 }
 
 async fn list_items(
-    State(state): State<AppState>,
+    State(state): State<Refresher>,
     ApiQuery(query): ApiQuery<ItemQuery>,
 ) -> Result<Json<ItemPage>, ApiError> {
     if query.feed_id.is_some_and(|id| id <= 0)
@@ -175,7 +181,7 @@ async fn list_items(
 }
 
 async fn get_item(
-    State(state): State<AppState>,
+    State(state): State<Refresher>,
     ApiPath(id): ApiPath<i64>,
 ) -> Result<Json<items::ItemDetail>, ApiError> {
     positive_id(id)?;
@@ -199,7 +205,7 @@ async fn live() -> Json<Health> {
     Json(Health { status: "ok" })
 }
 
-async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Health>) {
+async fn ready(State(state): State<Refresher>) -> (StatusCode, Json<Health>) {
     match tokio::time::timeout(
         Duration::from_secs(2),
         sqlx::query("SELECT 1").execute(&state.pool),
@@ -223,7 +229,7 @@ struct RegisterFeed {
 }
 
 async fn register_feed(
-    State(state): State<AppState>,
+    State(state): State<Refresher>,
     ApiJson(input): ApiJson<RegisterFeed>,
 ) -> Result<Json<feeds::Feed>, ApiError> {
     let url = feeds::normalize_feed_url(&input.url).map_err(|message| {
@@ -256,7 +262,7 @@ struct FeedPage {
 }
 
 async fn list_feeds(
-    State(state): State<AppState>,
+    State(state): State<Refresher>,
     ApiQuery(query): ApiQuery<FeedQuery>,
 ) -> Result<Json<FeedPage>, ApiError> {
     if query.after_id < 0 || !(1..=100).contains(&query.limit) {
@@ -287,7 +293,7 @@ struct PreviewRequest {
 }
 
 async fn preview_feed(
-    State(state): State<AppState>,
+    State(state): State<Refresher>,
     ApiJson(input): ApiJson<PreviewRequest>,
 ) -> Result<Json<feeds::FeedPreview>, ApiError> {
     if input.content.len() > feeds::MAX_PREVIEW_BYTES {
@@ -348,6 +354,109 @@ async fn method_not_allowed() -> ApiError {
     )
 }
 
+#[derive(Serialize)]
+struct ImportReport {
+    /// Feeds registered by this import. The scheduler fetches them shortly.
+    added: usize,
+    /// Feeds that were already registered.
+    existing: usize,
+    /// Outlines repeating a URL seen earlier in the file.
+    duplicates: usize,
+    feeds: Vec<ImportedFeed>,
+    /// Outlines whose URL is not a usable feed URL.
+    rejected: Vec<opml::RejectedOutline>,
+}
+
+#[derive(Serialize)]
+struct ImportedFeed {
+    id: i64,
+    url: String,
+    /// `added` or `existing`.
+    status: &'static str,
+    title: Option<String>,
+    folders: Vec<String>,
+}
+
+/// Imports subscriptions from an OPML file sent as the raw request body.
+/// Any content type is accepted, so `curl --data-binary @file.opml` works.
+async fn import_opml(
+    State(state): State<Refresher>,
+    body: Result<axum::body::Bytes, BytesRejection>,
+) -> Result<Json<ImportReport>, ApiError> {
+    let body = body?;
+    let found = tokio::task::spawn_blocking(move || opml::parse(&body))
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "OPML parser failed",
+            )
+        })?
+        .map_err(|failure| ApiError::failure(StatusCode::UNPROCESSABLE_ENTITY, failure))?;
+    let urls: Vec<String> = found.feeds.iter().map(|feed| feed.url.clone()).collect();
+    let registered = if urls.is_empty() {
+        Default::default()
+    } else {
+        feeds::register_many(&state.pool, &urls)
+            .await
+            .map_err(ApiError::database)?
+    };
+    let mut report = ImportReport {
+        added: 0,
+        existing: 0,
+        duplicates: found.duplicates,
+        feeds: Vec::with_capacity(found.feeds.len()),
+        rejected: found.rejected,
+    };
+    for feed in found.feeds {
+        let Some(&(id, added)) = registered.get(&feed.url) else {
+            report.rejected.push(opml::RejectedOutline {
+                url: feed.url,
+                code: "internal",
+                error: "feed could not be registered".into(),
+            });
+            continue;
+        };
+        if added {
+            report.added += 1;
+        } else {
+            report.existing += 1;
+        }
+        report.feeds.push(ImportedFeed {
+            id,
+            url: feed.url,
+            status: if added { "added" } else { "existing" },
+            title: feed.title,
+            folders: feed.folders,
+        });
+    }
+    Ok(Json(report))
+}
+
+/// Downloads every registered feed as an OPML file.
+async fn export_opml(State(state): State<Refresher>) -> Result<Response, ApiError> {
+    let feeds = feeds::all_urls(&state.pool)
+        .await
+        .map_err(ApiError::database)?;
+    let document = opml::write(
+        feeds
+            .iter()
+            .map(|(url, title)| (url.as_str(), title.as_deref())),
+    );
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/x-opml; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"subscriptions.opml\"",
+            ),
+        ],
+        document,
+    )
+        .into_response())
+}
+
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -392,6 +501,12 @@ impl ApiError {
 
 impl From<JsonRejection> for ApiError {
     fn from(rejection: JsonRejection) -> Self {
+        Self::rejected(rejection.status(), rejection.body_text())
+    }
+}
+
+impl From<BytesRejection> for ApiError {
+    fn from(rejection: BytesRejection) -> Self {
         Self::rejected(rejection.status(), rejection.body_text())
     }
 }

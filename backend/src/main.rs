@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rss_backend::{api, config::Config, db};
+use rss_backend::{api, config::Config, db, fetch::Fetcher, ingest::Refresher, scheduler};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -32,11 +32,31 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
         .context("could not bind HTTP listener")?;
+    let fetcher = Fetcher::new().context("could not initialize feed HTTP client")?;
+    let refresher = Refresher::new(pool.clone(), fetcher, config.poll_interval);
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let scheduler = if config.polling {
+        Some(tokio::spawn(scheduler::run(
+            refresher.clone(),
+            scheduler::TICK,
+            stopped,
+        )))
+    } else {
+        tracing::info!("automatic polling disabled");
+        None
+    };
     tracing::info!(address = %config.bind_addr, "RSS backend listening");
-    axum::serve(listener, api::router(pool.clone()))
-        .with_graceful_shutdown(shutdown_signal())
+    axum::serve(listener, api::router_with(refresher))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = stop.send(true);
+        })
         .await
         .context("HTTP server failed")?;
+    if let Some(scheduler) = scheduler {
+        // Waits for in-flight scheduled refreshes, up to the drain timeout.
+        let _ = scheduler.await;
+    }
     pool.close().await;
     Ok(())
 }

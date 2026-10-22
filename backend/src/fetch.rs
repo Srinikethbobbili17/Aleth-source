@@ -40,9 +40,12 @@ pub enum FetchResult {
     Modified {
         body: Vec<u8>,
         validators: Validators,
+        /// The feed permanently moved to `validators.url`.
+        moved: bool,
     },
     NotModified {
         validators: Validators,
+        moved: bool,
     },
 }
 
@@ -60,6 +63,18 @@ impl Fetcher {
                 .dns_resolver(Arc::new(PublicResolver))
                 .build()?,
         ))
+    }
+
+    /// A fetcher whose `host` resolves to a local test server. Production
+    /// fetchers always use the public-address resolver.
+    #[cfg(test)]
+    pub(crate) fn local(host: &str, address: SocketAddr) -> Self {
+        Self::with_client(
+            client_builder()
+                .resolve_to_addrs(host, &[address])
+                .build()
+                .unwrap(),
+        )
     }
 
     fn with_client(client: Client) -> Self {
@@ -96,6 +111,9 @@ impl Fetcher {
             .map_err(|message| Failure::new(FailureKind::InvalidUrl, message))?;
         let mut url = Url::parse(&normalized)
             .map_err(|_| Failure::new(FailureKind::InvalidUrl, "invalid feed URL"))?;
+        // A feed has moved only if every hop was permanent (301 or 308); one
+        // temporary redirect means the original URL is still the right one.
+        let mut permanent_hops = 0;
         for redirect in 0..=5 {
             validate_destination(&url)?;
             let host = url
@@ -130,6 +148,9 @@ impl Fetcher {
             let mut response = send_with_retry(request).await?;
             let status = response.status();
             if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+                if matches!(status.as_u16(), 301 | 308) {
+                    permanent_hops += 1;
+                }
                 if redirect == 5 {
                     return Err(Failure::new(
                         FailureKind::TooManyRedirects,
@@ -172,6 +193,7 @@ impl Fetcher {
                     ));
                 }
                 return Ok(FetchResult::NotModified {
+                    moved: redirect > 0 && permanent_hops == redirect,
                     validators: Validators {
                         etag: received.etag.or_else(|| validators.etag.clone()),
                         last_modified: received
@@ -233,6 +255,7 @@ impl Fetcher {
             return Ok(FetchResult::Modified {
                 body,
                 validators: received,
+                moved: redirect > 0 && permanent_hops == redirect,
             });
         }
         Err(Failure::new(
@@ -336,7 +359,7 @@ fn client_builder() -> reqwest::ClientBuilder {
         .no_brotli().no_deflate().no_zstd()
         .user_agent(concat!("rss-backend/", env!("CARGO_PKG_VERSION")))
         .default_headers([
-            (header::ACCEPT, header::HeaderValue::from_static("application/atom+xml, application/rss+xml, application/feed+json, application/xml, text/xml, application/json")),
+            (header::ACCEPT, header::HeaderValue::from_static("application/atom+xml, application/rss+xml, application/feed+json, application/xml, text/xml, application/json, */*;q=0.1")),
         ].into_iter().collect())
 }
 
@@ -487,6 +510,14 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn redirect(status: u16, location: &str) -> Response<Body> {
+        Response::builder()
+            .status(status)
+            .header("location", format!("http://fixture.test{location}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         use std::io::Write;
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -616,6 +647,21 @@ mod tests {
                             .body(Body::from("bytes"))
                             .unwrap(),
                         "/missing" => Response::builder().status(404).body(Body::empty()).unwrap(),
+                        "/moved" => redirect(301, "/moved-again"),
+                        "/moved-again" => redirect(308, "/final"),
+                        "/temporary" => redirect(302, "/final"),
+                        "/mixed" => redirect(301, "/temporary"),
+                        // Strict publishers answer 406 unless `*/*` is acceptable.
+                        "/final"
+                            if request
+                                .headers()
+                                .get(header::ACCEPT)
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|v| v.contains("*/*")) =>
+                        {
+                            Response::new(Body::from("final feed"))
+                        }
+                        "/final" => Response::builder().status(406).body(Body::empty()).unwrap(),
                         "/unconditional" => {
                             Response::builder().status(304).body(Body::empty()).unwrap()
                         }
@@ -644,7 +690,10 @@ mod tests {
             .fetch("http://fixture.test/etag", &Validators::default())
             .await
             .unwrap();
-        let FetchResult::Modified { body, validators } = first else {
+        let FetchResult::Modified {
+            body, validators, ..
+        } = first
+        else {
             panic!("expected body")
         };
         assert_eq!(body, b"feed bytes");
@@ -697,7 +746,27 @@ mod tests {
             "publisher returned HTTP 429 Too Many Requests"
         );
         assert_eq!(limited.retry_after_seconds, Some(120));
-        assert_eq!(seen.load(Ordering::SeqCst), 11);
+        // A feed has moved only when every redirect hop was permanent.
+        for (path, moved) in [("moved", true), ("temporary", false), ("mixed", false)] {
+            let FetchResult::Modified {
+                body,
+                validators,
+                moved: reported,
+            } = fetcher
+                .fetch(
+                    &format!("http://fixture.test/{path}"),
+                    &Validators::default(),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected body")
+            };
+            assert_eq!(body, b"final feed", "{path}");
+            assert_eq!(validators.url.as_deref(), Some("http://fixture.test/final"));
+            assert_eq!(reported, moved, "{path}");
+        }
+        assert_eq!(seen.load(Ordering::SeqCst), 19);
         server.abort();
     }
 
@@ -715,17 +784,19 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, publisher).await.unwrap();
         });
-        let client = client_builder()
-            .resolve_to_addrs("fixture.test", &[address])
-            .build()
-            .unwrap();
-        let fetcher = Fetcher::with_client(client);
         let feed = crate::feeds::register(&pool, "http://fixture.test/feed")
             .await
             .unwrap();
         // No parser slots at all: the download succeeds but cannot be parsed.
-        let result =
-            crate::ingest::refresh(&pool, &fetcher, Arc::new(Semaphore::new(0)), feed.id).await;
+        let refresher = crate::ingest::Refresher {
+            parser_slots: Arc::new(Semaphore::new(0)),
+            ..crate::ingest::Refresher::new(
+                pool.clone(),
+                Fetcher::local("fixture.test", address),
+                std::time::Duration::from_secs(600),
+            )
+        };
+        let result = refresher.refresh_now(feed.id).await;
         assert!(matches!(
             result,
             Err(crate::ingest::RefreshError::ParserBusy)
@@ -794,7 +865,7 @@ mod tests {
         let refresh_uri = format!("/v1/feeds/{feed_id}/refresh");
         for step in 0..4 {
             phase.store(step, Ordering::SeqCst);
-            sqlx::query("UPDATE feeds SET next_fetch_at = now() WHERE id = $1")
+            sqlx::query("UPDATE feeds SET manual_refresh_after = NULL WHERE id = $1")
                 .bind(feed_id)
                 .execute(&pool)
                 .await
