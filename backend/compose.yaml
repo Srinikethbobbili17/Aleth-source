@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: docker.io/library/postgres:17-bookworm
+    environment:
+      POSTGRES_USER: rss
+      POSTGRES_PASSWORD: rss_dev_password
+      POSTGRES_DB: rss
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rss -d rss"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+

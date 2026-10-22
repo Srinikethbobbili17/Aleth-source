@@ -1,0 +1,7 @@
+FROM docker.io/library/rust:1-bookworm
+
+RUN rustup component add rustfmt clippy
+
+ENV CARGO_HOME=/app/target/cargo-home
+WORKDIR /app
+CMD ["cargo", "run", "--locked"]

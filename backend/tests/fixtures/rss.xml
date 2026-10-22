@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <title>Example feed</title><link>https://example.com</link><description>A test feed</description>
+  <item><guid isPermaLink="false">first</guid><title>First article</title><link>https://example.com/first</link></item>
+</channel></rss>
+
