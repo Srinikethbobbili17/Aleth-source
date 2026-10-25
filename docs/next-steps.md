@@ -3,7 +3,7 @@
 Updated: 2026-10-22  
 Tick items off as they land. Background and reasoning are in [backend-progress-and-next-steps.md](backend-progress-and-next-steps.md).
 
-**Plan:** finish a complete, healthy, shippable backend first. Only then build a TUI on top of its API, to explore and understand the system. No CLI, TUI, or web client work happens before the backend meets the ship-ready definition below.
+**Plan:** finish a complete, healthy, shippable backend first. Only then build a TUI on top of its API, to explore and understand the system. No client is connected to the backend before it meets the ship-ready definition below. A standalone TUI design prototype on fixture data runs in parallel (see below).
 
 ## Done
 
@@ -53,7 +53,10 @@ The backend is ready for a TUI when all of these hold:
 - [x] Polling interval (`POLL_INTERVAL_SECONDS`, default 30 min) with ±10% jitter, one slot reserved for manual refreshes, clean shutdown with a 30 s drain, expired-lease recovery
 - [x] Tests: concurrent claimers never share a feed, expired leases are reclaimed, a slow feed does not block others, shutdown drains in-flight work
 - [x] CI warning fixed: `actions/checkout@v7` (Node.js 24)
-- [ ] Run unattended for a day against the feed corpus and record failures and lag
+- [ ] Run unattended for a day against the feed corpus and record failures and lag. **Attempt 1 (2026-10-22/24) was invalid:** the laptop suspended after about 1 hour (lid closed 20:58 IST, opened 02:32 IST two days later), so only one regular poll round and one catch-up burst ran. Findings below. Rerun on an always-on machine or with sleep inhibited.
+- [ ] Trial finding: a failure pushes the next poll a full interval out (`next_poll_at = max(backoff, interval)` in `ingest.rs`). Three feeds hit `dns_failed` in the first second after resume, before the network was up, and then waited 30 min instead of retrying after the 30 s backoff. Retry after the backoff, capped at the interval.
+- [ ] Trial finding: articles were lost during the gap. On resume, Hacker News, TechCrunch, Ars Technica, The Verge and NPR returned only new entries (zero already seen), so items published while the machine slept fell out of their feeds unseen. Record a gap per poll (no overlap with stored items) so it is visible; accept it as a limit of RSS for fast feeds.
+- [ ] Trial finding: after the catch-up burst all 19 feeds are due within a 5-minute window; ±10% jitter never spreads them out again. Consider spreading polls after a burst.
 - [ ] Publication-aware intervals: poll frequently updated feeds more often, quiet ones less
 - [ ] Metrics for due-feed lag (how late polls run) and scheduler throughput
 
@@ -62,7 +65,9 @@ The backend is ready for a TUI when all of these hold:
 - [x] Store the redirected URL after permanent (301/308) redirects
 - [x] Stop `<updated>`-only changes from creating a new article version (legacy fingerprints upgrade in place, verified on the trial's 2,690 articles)
 - [x] Batch the per-article SQL inside the refresh transaction (1,000-entry save: 3.8 s → 1.05 s in the test suite)
-- [ ] Trial finding to review: hnrss.org summaries embed live points/comment counts, so Hacker News items gain a version on most polls
+- [ ] Trial finding confirmed: hnrss.org summaries embed live points/comment counts. 21 Hacker News items hold 57 versions (19 of 20 items gained a version in a single poll). Other feeds' extra versions (Nature, BBC, The Verge, This Week in Rust) are genuine title/content edits.
+- [ ] Trial finding: a changed publication date alone creates a version (BBC, OpenAI News). Decide whether that counts as a meaningful change.
+- [ ] Trial finding: OpenAI News (1,313 entries) and Hugging Face (~900) never answer 304, so every poll downloads and re-hashes ~1,000 entries. Low priority at 30 min intervals.
 - [ ] Article version-history endpoint
 - [ ] Retention policy for old versions and items
 
@@ -79,7 +84,7 @@ The backend is ready for a TUI when all of these hold:
 - [x] OPML import: `POST /v1/imports/opml` with per-feed status, folders, duplicates, and rejected URLs; imported feeds are fetched by the scheduler within seconds
 - [x] OPML export: `GET /v1/exports/opml`; round-trips through import
 - [ ] Store OPML folders once folders exist
-- [ ] PostgreSQL full-text search over accessible articles
+- [ ] PostgreSQL full-text search over accessible articles. Requirement from the TUI prototype: search by topic, not exact title text. Match whole words in title, text, feed and folder; a topic query ("ai") must also find related terms (LLM, OpenAI, …), via embeddings or a synonym layer; newest first for now, importance ranking later.
 - [ ] Change feed or sync cursor so clients can fetch "what changed since X"
 
 ## Phase 6: API polish and operations
@@ -89,6 +94,19 @@ The backend is ready for a TUI when all of these hold:
 - [ ] Release container image (non-root), deployment config, migration step
 - [ ] Metrics: due-feed lag, fetch errors, refresh duration, DB pool usage
 - [ ] Automated backups with a tested restore
+
+## In parallel: TUI design prototype
+
+Separate folder, [`tui-prototype/`](../tui-prototype/README.md). It runs on fake data or a read-only trial snapshot and never calls the backend. Goal: settle layout, workflow, and AI preferences before the real client is built.
+
+- [x] Prototype: three-pane inbox, briefing, feed health view, mock AI summaries and story grouping, trial snapshot script
+- [x] Topic search: whole-word matching over title, text, feed and folder, with a hand-written topic table standing in for semantic search; newest first
+- [x] Semantic search with local Ollama: multilingual `bge-m3` preferred, `nomic-embed-text` fallback; precomputed article vectors, queries embedded on a background thread, per-query 3σ cutoff, added to keyword matches; 32 unit + integration tests
+- [ ] Cross-script queries (Hindi) score just under the 3σ cutoff; decide on a per-language cutoff or a lower one
+- [x] Multi-page layout: Home page with logo and folder tiles; each tile opens a folder page; Esc/Backspace go back
+- [ ] Search ranking: put the most important recent articles on top (user preference; needs an importance signal)
+- [ ] Use it on the trial snapshot and answer the open questions in its README
+- [ ] Record decisions here; turn them into API requirements for Phases 4–5
 
 ## After the backend ships: TUI
 
