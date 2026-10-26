@@ -2,11 +2,13 @@
 //! talks to the backend; see README.md.
 
 mod app;
+mod article;
 mod data;
 mod home;
 mod mock_ai;
 mod search;
 mod semantic;
+mod summary;
 mod ui;
 
 use std::path::PathBuf;
@@ -30,14 +32,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let semantic = semantic::Semantic::load(&ds, &path)?;
     let note = match &semantic {
         Some(sem) => format!(
-            "semantic search: {} ({}/{} articles embedded)",
-            sem.model,
+            "semantic search ({}/{} articles embedded)",
             sem.embedded,
             ds.items.len()
         ),
         None => "keyword search only (no embeddings; see README)".to_string(),
     };
-    let mut app = App::new(ds, semantic);
+    let summarizer = summary::Summarizer::for_fixture(&path);
+    let mut app = App::new(ds, semantic, summarizer);
     app.status = format!("{} · {note}", app.status);
 
     let mut terminal = ratatui::init();

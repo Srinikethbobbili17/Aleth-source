@@ -2,3 +2,6 @@
 # Real feed content from the local trial; regenerate with scripts/snapshot_trial.py
 /data/trial.json
 /data/*.embeddings.json
+# Written by the summarizer on first read of each article
+/data/*.summaries.json
+/data/*.summaries.tmp

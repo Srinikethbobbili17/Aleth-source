@@ -140,10 +140,7 @@ fn draw_brand(frame: &mut Frame, app: &App, area: Rect) {
                 format!("  ◆ {} cross-feed stories", s.stories),
                 Style::new().fg(AI),
             ),
-            Span::styled(
-                format!(" in the last {} (mock)", WINDOWS[app.window].1),
-                DIM,
-            ),
+            Span::styled(format!(" in the last {}", WINDOWS[app.window].1), DIM),
         ]),
         Line::raw(""),
         Line::from(vec![

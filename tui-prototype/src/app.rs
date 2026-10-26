@@ -4,10 +4,12 @@ use chrono::{DateTime, Duration, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
 
+use crate::article::Para;
 use crate::data::Dataset;
 use crate::mock_ai::{self, Entry};
 use crate::search::{self, Hit, Strength};
 use crate::semantic::{self, Semantic};
+use crate::summary::Summarizer;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -34,15 +36,43 @@ pub enum Source {
     Feed(i64),
 }
 
+/// Related articles listed at the end of the reader.
+pub const RELATED: usize = 5;
+
 /// Briefing look-back windows that `w` cycles through.
 pub const WINDOWS: &[(i64, &str)] = &[(6, "6 h"), (12, "12 h"), (24, "24 h"), (24 * 7, "7 d")];
 
 pub struct Reader {
     pub item: usize,
+    /// Past `max` means "stay at the end", so text arriving below (a summary
+    /// being written) stays in view.
     pub scroll: u16,
+    /// The furthest scroll position in the last drawn frame.
+    pub max: u16,
     /// Rendered paragraphs, cached with the width they were wrapped to.
-    pub paragraphs: Vec<String>,
+    pub paragraphs: Vec<Para>,
     pub width: u16,
+    /// Articles close in meaning, best first, with their similarity.
+    pub related: Vec<(usize, f32)>,
+    /// The related article `⏎` opens.
+    pub related_selected: Option<usize>,
+    /// A summary was asked for while this article was open.
+    pub summary_requested: bool,
+}
+
+impl Reader {
+    pub fn new(item: usize, semantic: Option<&Semantic>) -> Self {
+        Self {
+            item,
+            scroll: 0,
+            max: 0,
+            paragraphs: Vec::new(),
+            width: 0,
+            related: semantic.map_or_else(Vec::new, |s| s.related(item, RELATED)),
+            related_selected: None,
+            summary_requested: false,
+        }
+    }
 }
 
 pub struct App {
@@ -74,6 +104,7 @@ pub struct App {
     pub hits: HashMap<usize, Hit>,
     /// `None` when the fixture has no embeddings file.
     pub semantic: Option<Semantic>,
+    pub summarizer: Summarizer,
 
     pub reader: Option<Reader>,
     pub show_ai: bool,
@@ -91,7 +122,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(ds: Dataset, semantic: Option<Semantic>) -> Self {
+    pub fn new(ds: Dataset, semantic: Option<Semantic>, summarizer: Summarizer) -> Self {
         let window = 1;
         let checkpoint = ds.now - Duration::hours(WINDOWS[window].0);
         let mut app = Self {
@@ -115,6 +146,7 @@ impl App {
             index: None,
             hits: HashMap::new(),
             semantic,
+            summarizer,
             reader: None,
             show_ai: true,
             show_internals: false,
@@ -264,10 +296,29 @@ impl App {
         });
     }
 
-    /// Searches again when a semantic result for the current query has arrived.
+    /// Searches again when a semantic result for the current query has arrived,
+    /// and asks for a summary of the article being read.
     pub fn tick(&mut self) {
         if self.semantic.as_mut().is_some_and(Semantic::poll) {
             self.refilter();
+        }
+        self.summarizer.poll();
+        let reading = self.view == View::Inbox && (self.focus == Focus::Reader || self.zoom);
+        if let Some(reader) = self.reader.as_mut().filter(|_| reading && self.show_ai)
+            && !reader.summary_requested
+        {
+            reader.summary_requested = true;
+            self.summarizer.request(&self.ds.items[reader.item], false);
+        }
+    }
+
+    /// Writes the open article's summary again, e.g. after Ollama was down.
+    fn summarize_again(&mut self) {
+        if let Some(reader) = &mut self.reader {
+            reader.summary_requested = true;
+            self.show_ai = true;
+            self.summarizer.request(&self.ds.items[reader.item], true);
+            self.status = "writing summary".into();
         }
     }
 
@@ -278,7 +329,7 @@ impl App {
     }
 
     pub fn rebuild_brief(&mut self) {
-        self.brief = mock_ai::briefing(&self.ds, self.checkpoint);
+        self.brief = mock_ai::briefing(&self.ds, self.checkpoint, self.semantic.as_ref());
         self.brief_state
             .select(if self.brief.is_empty() { None } else { Some(0) });
         self.brief_source_state.select(Some(0));
@@ -287,12 +338,7 @@ impl App {
 
     fn open(&mut self, item: usize) {
         self.ds.read.insert(self.ds.items[item].id);
-        self.reader = Some(Reader {
-            item,
-            scroll: 0,
-            paragraphs: Vec::new(),
-            width: 0,
-        });
+        self.reader = Some(Reader::new(item, self.semantic.as_ref()));
     }
 
     /// Shows an article in the inbox, switching to "All" if the current filter hides it.
@@ -408,6 +454,7 @@ impl App {
             }
             (_, KeyCode::Char('z')) => self.zoom = !self.zoom,
             (_, KeyCode::Char('a')) => self.show_ai = !self.show_ai,
+            (_, KeyCode::Char('A')) => self.summarize_again(),
             (_, KeyCode::Char('i')) => self.show_internals = !self.show_internals,
             (_, KeyCode::Char('n')) => self.next_unread(),
             (_, KeyCode::Char('s')) => self.toggle_star(),
@@ -437,13 +484,39 @@ impl App {
                 self.focus = Focus::List;
                 self.zoom = false;
             }
+            (Focus::Reader, KeyCode::Char(']') | KeyCode::Char('[')) => {
+                if let Some(reader) = &mut self.reader
+                    && !reader.related.is_empty()
+                {
+                    let n = reader.related.len();
+                    reader.related_selected = Some(match (reader.related_selected, code) {
+                        (None, KeyCode::Char(']')) => 0,
+                        (None, _) => n - 1,
+                        (Some(k), KeyCode::Char(']')) => (k + 1) % n,
+                        (Some(k), _) => (k + n - 1) % n,
+                    });
+                    // The list sits at the very end of the article.
+                    reader.scroll = u16::MAX;
+                }
+            }
+            (Focus::Reader, KeyCode::Enter) => {
+                if let Some(&(item, _)) = self
+                    .reader
+                    .as_ref()
+                    .and_then(|r| r.related.get(r.related_selected?))
+                {
+                    self.jump_to(item);
+                    self.status = "opened related article · Esc back to the list".into();
+                }
+            }
             (Focus::Reader, c) => {
                 if let Some(reader) = &mut self.reader {
+                    let cur = reader.scroll.min(reader.max);
                     reader.scroll = match c {
-                        KeyCode::Char('j') | KeyCode::Down => reader.scroll.saturating_add(1),
-                        KeyCode::Char('k') | KeyCode::Up => reader.scroll.saturating_sub(1),
-                        KeyCode::Char(' ') | KeyCode::PageDown => reader.scroll.saturating_add(20),
-                        KeyCode::PageUp => reader.scroll.saturating_sub(20),
+                        KeyCode::Char('j') | KeyCode::Down => cur.saturating_add(1),
+                        KeyCode::Char('k') | KeyCode::Up => cur.saturating_sub(1),
+                        KeyCode::Char(' ') | KeyCode::PageDown => cur.saturating_add(20),
+                        KeyCode::PageUp => cur.saturating_sub(20),
                         KeyCode::Char('g') | KeyCode::Home => 0,
                         KeyCode::Char('G') | KeyCode::End => u16::MAX,
                         _ => reader.scroll,
@@ -630,6 +703,11 @@ mod tests {
     use super::*;
     use crate::semantic::{UNREACHABLE, fake_ollama};
 
+    /// Summaries are covered in `summary`; here Ollama is never reached.
+    fn no_summaries() -> Summarizer {
+        Summarizer::new("test", "http://127.0.0.1:1/api/chat", None)
+    }
+
     const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/fake.json");
     /// "Deep-sea survey finds dozens of new species"
     const SPECIES: i64 = 109;
@@ -656,7 +734,7 @@ mod tests {
             })
             .collect();
         let sem = Semantic::new("bge-m3", "", vectors, api).unwrap();
-        App::new(ds, Some(sem))
+        App::new(ds, Some(sem), no_summaries())
     }
 
     /// Waits for a pending semantic result and applies it, as the main loop would.
@@ -684,9 +762,88 @@ mod tests {
         &app.hits[&i]
     }
 
+    /// "Example Lang 2.5 brings incremental compilation", the one long article.
+    const LONG: i64 = 135;
+
+    fn index(app: &App, id: i64) -> usize {
+        app.ds.items.iter().position(|i| i.id == id).unwrap()
+    }
+
+    #[test]
+    fn opening_an_article_asks_for_its_summary() {
+        let mut app = App::new(dataset(), None, no_summaries());
+        let long = index(&app, LONG);
+        app.view = View::Inbox;
+        app.list_state
+            .select(app.visible.iter().position(|&i| i == long));
+        app.tick();
+        assert!(
+            app.summarizer.state(LONG).is_none(),
+            "a preview does not cost a summary"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.focus == Focus::Reader);
+        app.tick();
+        assert!(app.summarizer.state(LONG).is_some(), "opening it does");
+    }
+
+    #[test]
+    fn no_summary_while_ai_is_hidden() {
+        let mut app = App::new(dataset(), None, no_summaries());
+        app.show_ai = false;
+        app.jump_to(index(&app, LONG));
+        app.tick();
+        assert!(app.summarizer.state(LONG).is_none());
+        app.on_key(KeyEvent::from(KeyCode::Char('A')));
+        assert!(app.show_ai, "A shows the summary it asks for");
+        assert!(app.summarizer.state(LONG).is_some());
+    }
+
+    #[test]
+    fn related_articles_open_with_brackets_and_enter() {
+        let ds = dataset();
+        // Only the long article and the telescope story (105) point the same way.
+        let vectors = ds
+            .items
+            .iter()
+            .map(|i| {
+                Some(if [LONG, 105].contains(&i.id) {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                })
+            })
+            .collect();
+        let sem = Semantic::new("bge-m3", "", vectors, UNREACHABLE).unwrap();
+        let mut app = App::new(ds, Some(sem), no_summaries());
+        app.jump_to(index(&app, LONG));
+        let reader = app.reader.as_ref().unwrap();
+        let related: Vec<i64> = reader
+            .related
+            .iter()
+            .map(|&(i, _)| app.ds.items[i].id)
+            .collect();
+        assert_eq!(related, vec![105]);
+
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.reader.as_ref().unwrap().item,
+            index(&app, LONG),
+            "nothing chosen yet"
+        );
+        app.on_key(KeyEvent::from(KeyCode::Char(']')));
+        assert_eq!(app.reader.as_ref().unwrap().related_selected, Some(0));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let reader = app.reader.as_ref().unwrap();
+        assert_eq!(app.ds.items[reader.item].id, 105);
+        assert!(app.focus == Focus::Reader);
+        assert!(app.ds.read.contains(&105));
+    }
+
     #[test]
     fn keyword_search_without_semantic() {
-        let mut app = App::new(dataset(), None);
+        let mut app = App::new(dataset(), None, no_summaries());
         let found = search(&mut app, "outage");
         assert!(found.contains(&OUTAGE) && found.contains(&103) && found.contains(&111));
         assert!(app.hits.values().all(|h| h.strength != Strength::Similar));
@@ -713,7 +870,7 @@ mod tests {
     fn keyword_and_meaning_matches_combine() {
         let (api, server) = fake_ollama(200, r#"{"embeddings":[[1.0,0.0]]}"#);
         let mut app = app_with_semantic(OUTAGE, &api);
-        let keyword_only = search(&mut App::new(dataset(), None), "outage");
+        let keyword_only = search(&mut App::new(dataset(), None, no_summaries()), "outage");
         assert_eq!(
             search(&mut app, "outage"),
             keyword_only,
@@ -729,7 +886,7 @@ mod tests {
     #[test]
     fn ollama_down_falls_back_to_keywords() {
         let mut app = app_with_semantic(SPECIES, UNREACHABLE);
-        let keyword_only = search(&mut App::new(dataset(), None), "outage");
+        let keyword_only = search(&mut App::new(dataset(), None, no_summaries()), "outage");
         assert_eq!(search(&mut app, "outage"), keyword_only);
         assert!(
             app.status.starts_with("keyword search only: Ollama:"),

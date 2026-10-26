@@ -1,71 +1,12 @@
-//! Stand-ins for AI features. Nothing here calls a model: "summaries" are lead
-//! sentences pulled from the article, and "stories" are clusters of titles that
-//! share words. The point is to try out how AI output is shown, cited, and
-//! labelled in the TUI before deciding what real integration to build.
+//! The briefing: new articles grouped into cross-feed stories, then by folder.
+//! Stories are found by shared links, shared title words, or (with embeddings)
+//! closeness in meaning. What the briefing says about each article is still a
+//! stand-in: its lead sentence, unless an AI summary has been written for it.
 
 use chrono::{DateTime, Utc};
 
 use crate::data::Dataset;
-
-#[derive(Clone, Copy)]
-pub enum Input {
-    FullText,
-    Excerpt,
-    TitleOnly,
-}
-
-impl Input {
-    pub fn label(self) -> &'static str {
-        match self {
-            Input::FullText => "full text",
-            Input::Excerpt => "feed excerpt only",
-            Input::TitleOnly => "title only",
-        }
-    }
-}
-
-pub struct Claim {
-    /// 1-based paragraph number in the rendered article.
-    pub paragraph: usize,
-    pub text: String,
-}
-
-pub struct Summary {
-    pub input: Input,
-    pub words: usize,
-    pub claims: Vec<Claim>,
-}
-
-/// Builds a fake summary from the article's paragraphs, as rendered for display,
-/// so the paragraph numbers it cites match what the reader sees.
-pub fn summarize(has_content: bool, paragraphs: &[String]) -> Summary {
-    let words = paragraphs
-        .iter()
-        .map(|p| p.split_whitespace().count())
-        .sum();
-    let input = if paragraphs.is_empty() {
-        Input::TitleOnly
-    } else if has_content && words >= 120 {
-        Input::FullText
-    } else {
-        Input::Excerpt
-    };
-    let claims = paragraphs
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| p.split_whitespace().count() >= 12)
-        .take(3)
-        .map(|(i, p)| Claim {
-            paragraph: i + 1,
-            text: lead_sentence(p, 180),
-        })
-        .collect();
-    Summary {
-        input,
-        words,
-        claims,
-    }
-}
+use crate::semantic::Semantic;
 
 /// The first sentence of a paragraph, joined onto one line and capped in length.
 pub fn lead_sentence(paragraph: &str, max_chars: usize) -> String {
@@ -85,8 +26,13 @@ pub fn lead_sentence(paragraph: &str, max_chars: usize) -> String {
 }
 
 pub enum Entry {
-    /// Items from two or more feeds that look like the same story.
-    Story { label: String, items: Vec<usize> },
+    /// Items from two or more feeds that look like the same story. `by_meaning`
+    /// when at least one joined only because the embeddings say so.
+    Story {
+        label: String,
+        items: Vec<usize>,
+        by_meaning: bool,
+    },
     /// Everything else that is new in a folder.
     Folder { name: String, items: Vec<usize> },
 }
@@ -141,9 +87,14 @@ fn similarity(a: &[String], b: &[String]) -> f64 {
     }
 }
 
+/// True when the two sorted word lists share at least one word.
+fn shares_word(a: &[String], b: &[String]) -> bool {
+    a.iter().any(|w| b.binary_search(w).is_ok())
+}
+
 /// Briefing of items first seen after `since`: cross-feed stories first, then
 /// the remainder grouped by folder. Indices refer to `ds.items`.
-pub fn briefing(ds: &Dataset, since: DateTime<Utc>) -> Vec<Entry> {
+pub fn briefing(ds: &Dataset, since: DateTime<Utc>, semantic: Option<&Semantic>) -> Vec<Entry> {
     // Oldest first, so each story is seeded by its earliest report.
     let fresh: Vec<usize> = (0..ds.items.len())
         .rev()
@@ -151,13 +102,16 @@ pub fn briefing(ds: &Dataset, since: DateTime<Utc>) -> Vec<Entry> {
         .collect();
 
     // An item joins a story when it links to the same page as one of its
-    // reports, or its title is close to the seed's. Comparing with the seed
-    // only (not every member) stops loosely related titles chaining together.
+    // reports, its title is close to the seed's, or its text is close in
+    // meaning to the seed's. Comparing with the seed only (not every member)
+    // stops loosely related articles chaining together.
     struct Cluster {
+        seed: usize,
         seed_words: Vec<String>,
         urls: Vec<String>,
         feeds: Vec<i64>,
         items: Vec<usize>,
+        by_meaning: bool,
     }
     let mut clusters: Vec<Cluster> = Vec::new();
     for &i in &fresh {
@@ -168,31 +122,37 @@ pub fn briefing(ds: &Dataset, since: DateTime<Utc>) -> Vec<Entry> {
             .iter()
             .enumerate()
             .filter(|(_, c)| !c.feeds.contains(&item.feed_id))
-            .map(|(k, c)| {
-                let same_url = !url.is_empty() && c.urls.contains(&url);
-                (
-                    k,
-                    if same_url {
-                        1.0
-                    } else {
-                        similarity(&words, &c.seed_words)
-                    },
-                )
+            .filter_map(|(k, c)| {
+                if !url.is_empty() && c.urls.contains(&url) {
+                    return Some((k, 1.0, false));
+                }
+                let by_words = similarity(&words, &c.seed_words);
+                if by_words >= 0.5 {
+                    return Some((k, by_words, false));
+                }
+                let sem = semantic?;
+                let t = sem.thresholds;
+                let meaning = sem.similarity(i, c.seed)?;
+                (meaning >= t.story
+                    || (meaning >= t.story_with_shared_word && shares_word(&words, &c.seed_words)))
+                .then_some((k, f64::from(meaning), true))
             })
-            .filter(|&(_, score)| score >= 0.5)
             .max_by(|a, b| a.1.total_cmp(&b.1));
         match best {
-            Some((k, _)) => {
+            Some((k, _, by_meaning)) => {
                 let c = &mut clusters[k];
                 c.urls.push(url);
                 c.feeds.push(item.feed_id);
                 c.items.push(i);
+                c.by_meaning |= by_meaning;
             }
             None => clusters.push(Cluster {
+                seed: i,
                 seed_words: words,
                 urls: vec![url],
                 feeds: vec![item.feed_id],
                 items: vec![i],
+                by_meaning: false,
             }),
         }
     }
@@ -210,6 +170,7 @@ pub fn briefing(ds: &Dataset, since: DateTime<Utc>) -> Vec<Entry> {
             stories.push(Entry::Story {
                 label,
                 items: members,
+                by_meaning: cluster.by_meaning,
             });
             continue;
         }
@@ -237,4 +198,97 @@ pub fn briefing(ds: &Dataset, since: DateTime<Utc>) -> Vec<Entry> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use chrono::Duration;
+
+    use super::*;
+
+    const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/fake.json");
+
+    fn stories(entries: &[Entry], ds: &Dataset) -> Vec<(Vec<i64>, bool)> {
+        entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Story {
+                    items, by_meaning, ..
+                } => Some((items.iter().map(|&i| ds.items[i].id).collect(), *by_meaning)),
+                Entry::Folder { .. } => None,
+            })
+            .collect()
+    }
+
+    fn index(ds: &Dataset, id: i64) -> usize {
+        ds.items.iter().position(|i| i.id == id).unwrap()
+    }
+
+    #[test]
+    fn without_embeddings_stories_come_from_links_and_titles() {
+        let ds = Dataset::load(Path::new(FAKE)).unwrap();
+        let entries = briefing(&ds, ds.now - Duration::days(30), None);
+        let found = stories(&entries, &ds);
+        assert_eq!(found.len(), 4, "the fixture has four cross-feed stories");
+        assert!(found.iter().all(|(_, by_meaning)| !by_meaning));
+        let total: usize = entries.iter().map(|e| e.items().len()).sum();
+        assert_eq!(total, ds.items.len(), "every new item appears once");
+    }
+
+    #[test]
+    fn close_meaning_joins_articles_whose_titles_differ() {
+        let ds = Dataset::load(Path::new(FAKE)).unwrap();
+        // "Telescope spots water vapour…" (feed 4) and "Smartwatch maker recalls…"
+        // (feed 2) share no title words; give them the same vector.
+        let (a, b) = (index(&ds, 105), index(&ds, 134));
+        let vectors = (0..ds.items.len())
+            .map(|i| {
+                let mut v = vec![0.0; ds.items.len()];
+                v[if i == b { a } else { i }] = 1.0;
+                Some(v)
+            })
+            .collect();
+        let sem = Semantic::new("bge-m3", "", vectors, crate::semantic::UNREACHABLE).unwrap();
+        let entries = briefing(&ds, ds.now - Duration::days(30), Some(&sem));
+        let found = stories(&entries, &ds);
+        assert!(found.contains(&(vec![105, 134], true)), "{found:?}");
+        assert_eq!(found.len(), 5, "the four title stories stay as they were");
+    }
+
+    /// The real trial snapshot with bge-m3 vectors; skips when either is missing.
+    #[test]
+    fn trial_stories_by_meaning() {
+        let fixture = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/data/trial.json"));
+        if !fixture.exists() {
+            eprintln!("SKIP: no data/trial.json");
+            return;
+        }
+        let ds = Dataset::load(fixture).unwrap();
+        let Some(sem) = Semantic::load(&ds, fixture)
+            .unwrap()
+            .filter(|s| s.model == "bge-m3")
+        else {
+            eprintln!("SKIP: no bge-m3 embeddings for the trial");
+            return;
+        };
+        let entries = briefing(&ds, ds.now - Duration::days(365), Some(&sem));
+        let story_of = |needle: &str| {
+            entries.iter().position(|e| {
+                matches!(e, Entry::Story { .. })
+                    && e.items()
+                        .iter()
+                        .any(|&i| ds.items[i].title().contains(needle))
+            })
+        };
+        // Same story, headlines with no words in common.
+        let dogs = story_of("Warhound raises");
+        assert!(dogs.is_some() && dogs == story_of("Genetically Modified"));
+        // bge-m3 scores these 0.76 apart; they must not become one story.
+        let rust = story_of("Announcing Rust 1.99.0");
+        assert!(rust.is_none() || rust != story_of("Bird Feeder"));
+        let total: usize = entries.iter().map(|e| e.items().len()).sum();
+        assert_eq!(total, ds.items.len());
+    }
 }

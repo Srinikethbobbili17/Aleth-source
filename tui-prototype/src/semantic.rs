@@ -37,6 +37,37 @@ struct EmbedResponse {
     embeddings: Vec<Vec<f32>>,
 }
 
+/// Article-to-article similarities that mean something, per model. bge-m3 and
+/// nomic score on different scales (the mean over cross-feed pairs in the trial
+/// is 0.36 and 0.56), so each needs its own. Tuned by hand on the trial snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Thresholds {
+    /// Same story on its own. bge-m3 needs this high: it scores long release
+    /// announcements alike whatever they announce (Rust 1.99 vs a bird feeder: 0.76).
+    pub story: f32,
+    /// Same story when the titles also share a word.
+    pub story_with_shared_word: f32,
+    /// Worth listing under "Related" in the article view.
+    pub related: f32,
+}
+
+impl Thresholds {
+    pub fn for_model(model: &str) -> Self {
+        match model {
+            "nomic-embed-text" => Self {
+                story: 0.88,
+                story_with_shared_word: 0.84,
+                related: 0.76,
+            },
+            _ => Self {
+                story: 0.78,
+                story_with_shared_word: 0.70,
+                related: 0.62,
+            },
+        }
+    }
+}
+
 pub struct Score {
     pub similarity: f32,
     /// Standard deviations above the mean similarity for this query.
@@ -46,7 +77,9 @@ pub struct Score {
 type Embedding = Result<Vec<f32>, String>;
 
 pub struct Semantic {
+    #[cfg(test)]
     pub model: &'static str,
+    pub thresholds: Thresholds,
     /// Unit vectors by item index; `None` for articles missing from the file.
     vectors: Vec<Option<Vec<f32>>>,
     pub embedded: usize,
@@ -126,7 +159,9 @@ impl Semantic {
         };
         let (requests, results) = spawn_worker(embedder);
         Ok(Self {
+            #[cfg(test)]
             model,
+            thresholds: Thresholds::for_model(model),
             embedded: vectors.iter().filter(|v| v.is_some()).count(),
             vectors,
             #[cfg(test)]
@@ -161,6 +196,27 @@ impl Semantic {
                 Ok(None)
             }
         }
+    }
+
+    /// Cosine similarity of two articles, by item index.
+    pub fn similarity(&self, a: usize, b: usize) -> Option<f32> {
+        Some(dot(
+            self.vectors.get(a)?.as_ref()?,
+            self.vectors.get(b)?.as_ref()?,
+        ))
+    }
+
+    /// Up to `limit` articles closest in meaning to `item`, best first, that
+    /// clear the model's `related` threshold.
+    pub fn related(&self, item: usize, limit: usize) -> Vec<(usize, f32)> {
+        let mut out: Vec<(usize, f32)> = (0..self.vectors.len())
+            .filter(|&i| i != item)
+            .filter_map(|i| Some((i, self.similarity(item, i)?)))
+            .filter(|&(_, s)| s >= self.thresholds.related)
+            .collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1));
+        out.truncate(limit);
+        out
     }
 
     /// Stores embeddings that finished since the last call. True when the latest
@@ -289,13 +345,24 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// A one-shot stand-in for Ollama, so tests can check requests and failures offline.
+/// A one-shot stand-in for Ollama's embed endpoint, so tests can check requests
+/// and failures offline.
 #[cfg(test)]
 pub(crate) fn fake_ollama(status: u16, body: &str) -> (String, std::thread::JoinHandle<String>) {
+    fake_ollama_at("/api/embed", status, body)
+}
+
+/// Answers one request to `http://<random port><path>` and returns the request body.
+#[cfg(test)]
+pub(crate) fn fake_ollama_at(
+    path: &str,
+    status: u16,
+    body: &str,
+) -> (String, std::thread::JoinHandle<String>) {
     use std::io::{BufRead, BufReader, Read, Write};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let api = format!("http://{}/api/embed", listener.local_addr().unwrap());
+    let api = format!("http://{}{path}", listener.local_addr().unwrap());
     let body = body.to_string();
     let handle = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -488,6 +555,33 @@ mod tests {
         assert!((first.sigma - 2f32.sqrt()).abs() < 1e-5, "{}", first.sigma);
         assert!((scores[1].as_ref().unwrap().sigma + 1.0 / 2f32.sqrt()).abs() < 1e-5);
         assert!(scores[2].is_none(), "unembedded article must stay unscored");
+    }
+
+    #[test]
+    fn related_articles_are_the_closest_above_the_threshold() {
+        let v = |x: f32| Some(unit(&[1.0, x]));
+        // Similarities to item 0: 1.0 (item 1), ~0.99, ~0.71, and item 4 unembedded.
+        let sem = semantic(vec![v(0.0), v(0.0), v(0.15), v(1.0), None], UNREACHABLE);
+        assert_eq!(sem.thresholds, Thresholds::for_model("bge-m3"));
+        let related: Vec<usize> = sem.related(0, 5).into_iter().map(|(i, _)| i).collect();
+        assert_eq!(related, vec![1, 2, 3], "best first, never itself");
+        assert_eq!(sem.related(0, 2).len(), 2);
+        assert!(sem.similarity(0, 4).is_none());
+        // 0.71 is related for bge-m3 but not for nomic, which scores higher overall.
+        let pair = vec![v(0.0), v(1.0)];
+        assert_eq!(semantic(pair.clone(), UNREACHABLE).related(0, 5).len(), 1);
+        let nomic = Semantic::new("nomic-embed-text", "", pair, UNREACHABLE).unwrap();
+        assert!(nomic.related(0, 5).is_empty());
+    }
+
+    #[test]
+    fn thresholds_differ_per_model() {
+        let bge = Thresholds::for_model("bge-m3");
+        let nomic = Thresholds::for_model("nomic-embed-text");
+        assert!(nomic.related > bge.related && nomic.story > bge.story);
+        for t in [bge, nomic] {
+            assert!(t.related < t.story_with_shared_word && t.story_with_shared_word < t.story);
+        }
     }
 
     #[test]
